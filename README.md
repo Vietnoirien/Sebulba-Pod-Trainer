@@ -44,7 +44,7 @@ The trainer features a full GUI application built with wxPython, real-time train
 
 ### Install the Package
 ```bash
-git clone <repository-url>
+git clone https://github.com/Vietnoirien/Sebulba-Pod-Trainer
 cd sebulba_pod_trainer
 pip install -e .
 ```
@@ -109,8 +109,8 @@ This project uses **Proximal Policy Optimization (PPO)**, a state-of-the-art pol
 ## 📊 Performance
 
 ### Hardware Testing
-- **RTX 3060**: ~1 second per training step (32 batch size, 32 mini-batch size)
-- **GTX 1060**: ~1 second per training step (32 batch size, 32 mini-batch size)
+- **RTX 3060**: ~1 second per batch size (32 batch size, 32 mini-batch size)
+- **GTX 1060**: ~1 second per batch size (32 batch size, 32 mini-batch size)
 - **Multi-GPU scaling**: Linear improvement with additional GPUs
 
 ### Training Recommendations
