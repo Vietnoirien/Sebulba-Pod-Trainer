@@ -1,0 +1,13 @@
+{
+  "device": "cuda",
+  "multi_gpu": false,
+  "devices": [],
+  "batch_size": 64,
+  "learning_rate": 0.0003,
+  "save_dir": "models",
+  "use_mixed_precision": true,
+  "network_config": {
+    "observation_dim": 27,
+    "hidden_dim": 256
+  }
+}
