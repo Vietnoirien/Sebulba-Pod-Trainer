@@ -20,11 +20,22 @@ class OptimizedRaceEnvironment:
                 num_checkpoints: int = 3,
                 laps: int = 3,
                 batch_size: int = 64,
-                device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')):
+                device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+                randomize_checkpoints: bool = True,
+                min_checkpoints: int = 3,
+                max_checkpoints: int = 6):
         self.device = device
         self.batch_size = batch_size
-        self.num_checkpoints = num_checkpoints
+        self.base_num_checkpoints = num_checkpoints
         self.laps = laps
+
+        # Add randomization parameters
+        self.randomize_checkpoints = randomize_checkpoints
+        self.min_checkpoints = min_checkpoints
+        self.max_checkpoints = max_checkpoints
+
+        # num_checkpoints and total_checkpoints will be set per batch in reset()
+        self.num_checkpoints = num_checkpoints
         self.total_checkpoints = num_checkpoints * laps
         
         # Initialize environment state
@@ -71,47 +82,59 @@ class OptimizedRaceEnvironment:
         self.batch_indices = torch.arange(self.batch_size, device=self.device)
     
     def _generate_tracks(self) -> None:
-        """Generate random tracks for each batch - optimized version"""
-        # Create random checkpoints for each batch at once
-        self.checkpoints = torch.zeros(self.batch_size, self.num_checkpoints, 2, device=self.device)
+        """Generate random tracks for each batch - with randomized checkpoint counts"""
+        # Randomize number of checkpoints per batch if enabled
+        if self.randomize_checkpoints:
+            # Generate random checkpoint counts for each batch
+            checkpoint_counts = torch.randint(
+                self.min_checkpoints, 
+                self.max_checkpoints + 1, 
+                (self.batch_size,), 
+                device=self.device
+            )
+            max_checkpoints_in_batch = checkpoint_counts.max().item()
+            self.batch_checkpoint_counts = checkpoint_counts
+        else:
+            max_checkpoints_in_batch = self.base_num_checkpoints
+            self.batch_checkpoint_counts = torch.full(
+                (self.batch_size,), 
+                self.base_num_checkpoints, 
+                device=self.device
+            )
         
-        # Generate first checkpoint for all batches at once
-        self.checkpoints[:, 0, 0] = torch.randint(2000, WIDTH-2000, (self.batch_size,), device=self.device).float()
-        self.checkpoints[:, 0, 1] = torch.randint(2000, HEIGHT-2000, (self.batch_size,), device=self.device).float()
+        # Create checkpoints tensor with maximum size needed
+        self.checkpoints = torch.zeros(self.batch_size, max_checkpoints_in_batch, 2, device=self.device)
         
-        # Generate remaining checkpoints with vectorized distance constraints
-        for i in range(1, self.num_checkpoints):
-            # Try up to 5 times to find valid positions (reduced from 10 for speed)
-            for attempt in range(5):
-                # Generate candidate positions for all batches at once
-                candidates_x = torch.randint(2000, WIDTH-2000, (self.batch_size,), device=self.device).float()
-                candidates_y = torch.randint(2000, HEIGHT-2000, (self.batch_size,), device=self.device).float()
-                candidates = torch.stack([candidates_x, candidates_y], dim=1)
-                
-                # Calculate distances from all previous checkpoints in one operation
-                valid_mask = torch.ones(self.batch_size, dtype=torch.bool, device=self.device)
-                
-                for j in range(i):
-                    # Calculate distances to previous checkpoint j for all batches
-                    distances = torch.norm(
-                        self.checkpoints[:, j] - candidates,
-                        dim=1
-                    )
-                    # Update valid mask - positions must be far enough from all previous checkpoints
-                    valid_mask &= (distances > 3000)
-                
-                # Update valid positions
-                self.checkpoints[valid_mask, i] = candidates[valid_mask]
-                
-                # If all batches have valid positions, we're done
-                if valid_mask.all():
-                    break
-                
-            # For any remaining invalid positions, just place them randomly
-            if not valid_mask.all():
-                invalid_mask = ~valid_mask
-                self.checkpoints[invalid_mask, i, 0] = torch.randint(2000, WIDTH-2000, (invalid_mask.sum(),), device=self.device).float()
-                self.checkpoints[invalid_mask, i, 1] = torch.randint(2000, HEIGHT-2000, (invalid_mask.sum(),), device=self.device).float()
+        # Generate checkpoints for each batch individually
+        for batch_idx in range(self.batch_size):
+            num_cp = self.batch_checkpoint_counts[batch_idx].item()
+            
+            # Generate first checkpoint
+            self.checkpoints[batch_idx, 0, 0] = torch.randint(2000, WIDTH-2000, (1,), device=self.device).float()
+            self.checkpoints[batch_idx, 0, 1] = torch.randint(2000, HEIGHT-2000, (1,), device=self.device).float()
+            
+            # Generate remaining checkpoints with distance constraints
+            for i in range(1, num_cp):
+                for attempt in range(5):
+                    candidate_x = torch.randint(2000, WIDTH-2000, (1,), device=self.device).float()
+                    candidate_y = torch.randint(2000, HEIGHT-2000, (1,), device=self.device).float()
+                    candidate = torch.tensor([candidate_x, candidate_y], device=self.device)
+                    
+                    # Check distance from all previous checkpoints
+                    valid = True
+                    for j in range(i):
+                        distance = torch.norm(self.checkpoints[batch_idx, j] - candidate)
+                        if distance <= 3000:
+                            valid = False
+                            break
+                    
+                    if valid:
+                        self.checkpoints[batch_idx, i] = candidate
+                        break
+                else:
+                    # Fallback: place randomly if no valid position found
+                    self.checkpoints[batch_idx, i, 0] = torch.randint(2000, WIDTH-2000, (1,), device=self.device).float()
+                    self.checkpoints[batch_idx, i, 1] = torch.randint(2000, HEIGHT-2000, (1,), device=self.device).float()
     
     def reset(self) -> Dict[str, torch.Tensor]:
         """Reset the environment to initial state"""
@@ -159,12 +182,24 @@ class OptimizedRaceEnvironment:
         return self._get_observations()
     
     def _get_observations(self) -> Dict[str, torch.Tensor]:
-        """Get observations for all pods - optimized version"""
+        """Get observations for all pods - updated with absolute angles"""
         observations = {}
         
-        # Pre-compute next checkpoint indices for all pods
-        next_cp_indices = [pod.current_checkpoint % self.num_checkpoints for pod in self.pods]
-        next_next_cp_indices = [(pod.current_checkpoint + 1) % self.num_checkpoints for pod in self.pods]
+        # Pre-compute next checkpoint indices for all pods (with modulo based on batch-specific counts)
+        next_cp_indices = []
+        next_next_cp_indices = []
+        
+        for pod in self.pods:
+            next_cp_idx = torch.zeros_like(pod.current_checkpoint)
+            next_next_cp_idx = torch.zeros_like(pod.current_checkpoint)
+            
+            for b in range(self.batch_size):
+                num_cp = self.batch_checkpoint_counts[b].item()
+                next_cp_idx[b] = pod.current_checkpoint[b] % num_cp
+                next_next_cp_idx[b] = (pod.current_checkpoint[b] + 1) % num_cp
+            
+            next_cp_indices.append(next_cp_idx)
+            next_next_cp_indices.append(next_next_cp_idx)
         
         # Pre-compute next checkpoint positions for all pods
         next_cp_positions = []
@@ -216,28 +251,49 @@ class OptimizedRaceEnvironment:
             
             self.rel_next_next_cp_cache.copy_(self.normalized_next_next_cp_cache)
             self.rel_next_next_cp_cache.sub_(self.normalized_position_cache)
+
+            # Pod's absolute angle as sin/cos
+            pod_angle_rad = torch.deg2rad(pod.angle)
+            pod_angle_sin = torch.sin(pod_angle_rad)
+            pod_angle_cos = torch.cos(pod_angle_rad)
+
+            # Angle to next checkpoint as sin/cos
+            angle_to_next_cp = pod.angle_to(next_cp_positions[pod_idx])
+            angle_to_next_cp_rad = torch.deg2rad(angle_to_next_cp)
+            angle_to_next_cp_sin = torch.sin(angle_to_next_cp_rad)
+            angle_to_next_cp_cos = torch.cos(angle_to_next_cp_rad)
+
+            # Relative angle (how much to turn)
+            relative_angle = angle_to_next_cp - pod.angle
+            relative_angle = ((relative_angle + 180) % 360) - 180
+            relative_angle_normalized = relative_angle / 180.0
+
+            # Speed and direction metrics
+            speed_magnitude = torch.norm(pod.velocity, dim=1, keepdim=True) / 800.0
+            distance_to_next_cp = torch.norm(next_cp_positions[pod_idx] - pod.position, dim=1, keepdim=True)
+            distance_normalized = distance_to_next_cp / 600.0  # Normalize by checkpoint radius
             
-            # Calculate angle to next checkpoint (normalized to [-1, 1])
-            angle_to_next_cp = pod.angle_to(next_cp_positions[pod_idx]) - pod.angle
-            angle_to_next_cp = (angle_to_next_cp + 180) % 360 - 180  # Normalize to [-180, 180]
-            normalized_angle = angle_to_next_cp / 180.0  # Scale to [-1, 1]
-            
-            # Combine all observations
-            # Use torch.cat only once to reduce overhead
+            batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
+            progress = pod.current_checkpoint.float() / batch_total_checkpoints.float().unsqueeze(1)
+
+            # Pod-specific observations (18 dimensions)
             pod_specific_obs = torch.cat([
-                self.normalized_position_cache,
-                self.normalized_velocity_cache,
-                self.rel_next_cp_cache,
-                self.rel_next_next_cp_cache,
-                normalized_angle,
-                pod.current_checkpoint.float() / self.total_checkpoints,  # Progress
-                pod.shield_cooldown / 3.0,  # Normalized shield cooldown
-                pod.boost_available.float()  # Boost availability
+                self.normalized_position_cache,             # Pod position (2)
+                self.normalized_velocity_cache,             # Pod velocity (2)  
+                self.rel_next_cp_cache,                     # Relative position to next checkpoint (2)
+                self.rel_next_next_cp_cache,                # Relative position to next-next checkpoint (2)
+                pod_angle_sin, pod_angle_cos,               # Pod angle (sin/cos) (2)
+                angle_to_next_cp_sin, angle_to_next_cp_cos, # Angle to target (sin/cos) (2)
+                relative_angle_normalized,                  # How much to turn (1)
+                speed_magnitude,                            # Current speed (1)
+                distance_normalized,                        # Distance to next checkpoint (1)
+                progress,                                   # Progress (1)
+                pod.shield_cooldown / 3.0,                  # Shield cooldown (1)
+                pod.boost_available.float()                 # Boost availability (1)
             ], dim=1)
-            
+
             # Add opponent information
-            opponent_obs_list = [pod_specific_obs]
-            
+            opponent_obs_list = []
             for opp_idx in range(4):
                 if opp_idx != pod_idx:  # Skip self
                     opp_pod = self.pods[opp_idx]
@@ -254,15 +310,34 @@ class OptimizedRaceEnvironment:
                     # Distance to opponent (normalized)
                     distance = torch.norm(rel_pos, dim=1, keepdim=True) / (WIDTH/2)
                     
-                    # Add to list for single concatenation
+                    # Opponent's absolute angle
+                    opp_normalized_angle = (opp_pod.angle % 360) / 180.0 - 1.0
+                    
+                    # Opponent's progress
+                    batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
+                    opp_progress = opp_pod.current_checkpoint.float() / batch_total_checkpoints.float().unsqueeze(1)
+                    
+                    # Opponent's next checkpoint
+                    opp_next_cp_normalized = (opp_pod.current_checkpoint % self.num_checkpoints).float() / self.num_checkpoints
+                    
+                    # Add to list for single concatenation (10 dimensions per opponent)
                     opponent_obs_list.append(torch.cat([
-                        normalized_rel_pos,
-                        normalized_rel_vel,
-                        distance
+                        normalized_rel_pos,                    # (2)
+                        normalized_rel_vel,                    # (2)
+                        distance,                             # (1)
+                        opp_normalized_angle,                 # (1)
+                        opp_progress,                         # (1)
+                        opp_next_cp_normalized,               # (1)
+                        opp_pod.shield_cooldown / 3.0,       # (1)
+                        opp_pod.boost_available.float()       # (1)
                     ], dim=1))
-            
-            # Single concatenation for all opponent data
-            observations[obs_key] = torch.cat(opponent_obs_list, dim=1)
+                            
+            # Combine pod-specific and opponent observations
+            # Pod-specific: 18 dimensions
+            # Opponent data: 3 opponents × 10 dimensions = 30 dimensions
+            # Total: 18 + 30 = 48 dimensions
+            all_opponent_obs = torch.cat(opponent_obs_list, dim=1)
+            observations[obs_key] = torch.cat([pod_specific_obs, all_opponent_obs], dim=1)
         
         return observations
     
@@ -438,16 +513,15 @@ class OptimizedRaceEnvironment:
         pod_j.velocity[collision_indices] = vel_j_new
     
     def _check_checkpoints(self) -> None:
-        """Optimized checkpoint checking"""
-        # Process all pods at once
+        """Optimized checkpoint checking - updated for variable checkpoint counts"""
         for pod_idx, pod in enumerate(self.pods):
             # Get batch-specific next checkpoint positions
-            next_cp_idx = pod.current_checkpoint % self.num_checkpoints
-            
-            # Vectorized gathering of checkpoint positions
             next_cp_positions = torch.zeros(self.batch_size, 2, device=self.device)
+            
             for b in range(self.batch_size):
-                next_cp_positions[b] = self.checkpoints[b, next_cp_idx[b].item()]
+                num_cp = self.batch_checkpoint_counts[b].item()
+                next_cp_idx = pod.current_checkpoint[b] % num_cp
+                next_cp_positions[b] = self.checkpoints[b, next_cp_idx]
             
             # Check distances to next checkpoints
             diff = pod.position - next_cp_positions
@@ -458,32 +532,29 @@ class OptimizedRaceEnvironment:
             if reached.any():
                 pod.current_checkpoint[reached] += 1
                 self.last_checkpoint_turn[reached, pod_idx] = self.turn_count[reached].squeeze()
-    
+
     def _update_race_status(self) -> None:
-        """Update race status, checking for completion or timeout - optimized version"""
-        # Reset done tensor
+        """Update race status - updated for variable checkpoint counts"""
         new_done = torch.zeros_like(self.done)
         
+        # Calculate total checkpoints per batch
+        batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
+        
         # Check if any pod has completed all checkpoints
-        for player_idx in range(2):  # Two players
+        for player_idx in range(2):
             player_pods = [self.pods[player_idx*2], self.pods[player_idx*2+1]]
             
             for pod in player_pods:
-                # Check if pod has completed all checkpoints
-                race_completed = pod.current_checkpoint >= self.total_checkpoints
-                
-                # Mark races as done where this player has won
-                new_done = new_done | race_completed.squeeze()
+                # Check if pod has completed all checkpoints (batch-specific)
+                race_completed = pod.current_checkpoint.squeeze() >= batch_total_checkpoints
+                new_done = new_done | race_completed
         
-        # Check for timeout (100 turns without reaching a checkpoint)
+        # Check for timeout (unchanged)
         for pod_idx, pod in enumerate(self.pods):
             turns_since_checkpoint = self.turn_count - self.last_checkpoint_turn[:, pod_idx].unsqueeze(1)
             timeout = turns_since_checkpoint > MAX_TURNS_WITHOUT_CHECKPOINT
-            
-            # Mark races as done where timeout occurred
             new_done = new_done | timeout.squeeze()
         
-        # Update done tensor
         self.done = new_done
     
     def _calculate_rewards(self) -> Dict[str, torch.Tensor]:
@@ -508,7 +579,8 @@ class OptimizedRaceEnvironment:
             pod_key = f"player{player_idx}_pod{team_pod_idx}"
             
             # Base reward is progress through checkpoints
-            self.checkpoint_reward_cache.copy_(pod.current_checkpoint.float() / self.total_checkpoints)
+            batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
+            self.checkpoint_reward_cache.copy_(pod.current_checkpoint.float() / batch_total_checkpoints.float().unsqueeze(1))
             
             # Distance-based reward (closer to next checkpoint is better)
             diff = pod.position - next_cp_positions[pod_idx]
@@ -552,3 +624,19 @@ class OptimizedRaceEnvironment:
             # Return first batch's checkpoints
             return self.checkpoints[0].cpu().numpy().tolist()
         return []
+    
+    def get_pod_states(self):
+        """Get current pod states for visualization"""
+        pod_states = []
+        for pod_idx, pod in enumerate(self.pods):
+            # Get first batch item for visualization
+            state = {
+                'position': pod.position[0].cpu().numpy().tolist(),
+                'velocity': pod.velocity[0].cpu().numpy().tolist(),
+                'angle': float(pod.angle[0].cpu().numpy()),
+                'current_checkpoint': int(pod.current_checkpoint[0].cpu().numpy()),
+                'shield_cooldown': int(pod.shield_cooldown[0].cpu().numpy()),
+                'boost_available': bool(pod.boost_available[0].cpu().numpy())
+            }
+            pod_states.append(state)
+        return pod_states

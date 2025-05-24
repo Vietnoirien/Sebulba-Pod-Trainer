@@ -29,7 +29,7 @@ class ModelPanel(wx.Panel):
         # Input dimension
         input_sizer = wx.BoxSizer(wx.HORIZONTAL)
         input_label = wx.StaticText(self, label="Observation Dimension:")
-        self.input_dim_ctrl = wx.SpinCtrl(self, min=1, max=100, initial=27)
+        self.input_dim_ctrl = wx.SpinCtrl(self, min=1, max=100, initial=48)  # Updated for new observation format
         input_sizer.Add(input_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         input_sizer.Add(self.input_dim_ctrl, 0, wx.EXPAND)
         arch_sizer.Add(input_sizer, 0, wx.EXPAND | wx.ALL, 5)
@@ -47,9 +47,9 @@ class ModelPanel(wx.Panel):
         
         # Set default values
         self.layers_grid.SetCellValue(0, 0, "Linear+ReLU")
-        self.layers_grid.SetCellValue(0, 1, "32")  # Reduced from 64
+        self.layers_grid.SetCellValue(0, 1, "24")  # Reduced from 32
         self.layers_grid.SetCellValue(1, 0, "Linear+ReLU")
-        self.layers_grid.SetCellValue(1, 1, "32")  # Reduced from 64
+        self.layers_grid.SetCellValue(1, 1, "16")  # Reduced from 32
         
         # Create dropdown editor for layer type
         layer_types = ["Linear", "Linear+ReLU", "Linear+Tanh", "Linear+Sigmoid"]
@@ -79,7 +79,7 @@ class ModelPanel(wx.Panel):
         # Policy head
         policy_sizer = wx.BoxSizer(wx.HORIZONTAL)
         policy_label = wx.StaticText(self, label="Policy Head Hidden Size:")
-        self.policy_size_ctrl = wx.SpinCtrl(self, min=8, max=128, initial=16)  # Reduced from 128
+        self.policy_size_ctrl = wx.SpinCtrl(self, min=8, max=128, initial=12)  # Reduced from 16
         policy_sizer.Add(policy_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         policy_sizer.Add(self.policy_size_ctrl, 0, wx.EXPAND)
         output_sizer.Add(policy_sizer, 0, wx.EXPAND | wx.ALL, 5)
@@ -87,7 +87,7 @@ class ModelPanel(wx.Panel):
         # Value head
         value_sizer = wx.BoxSizer(wx.HORIZONTAL)
         value_label = wx.StaticText(self, label="Value Head Hidden Size:")
-        self.value_size_ctrl = wx.SpinCtrl(self, min=8, max=128, initial=16)  # Reduced from 128
+        self.value_size_ctrl = wx.SpinCtrl(self, min=8, max=128, initial=12)  # Reduced from 16
         value_sizer.Add(value_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         value_sizer.Add(self.value_size_ctrl, 0, wx.EXPAND)
         output_sizer.Add(value_sizer, 0, wx.EXPAND | wx.ALL, 5)
@@ -95,7 +95,7 @@ class ModelPanel(wx.Panel):
         # Special action head
         special_sizer = wx.BoxSizer(wx.HORIZONTAL)
         special_label = wx.StaticText(self, label="Special Action Head Hidden Size:")
-        self.special_size_ctrl = wx.SpinCtrl(self, min=8, max=128, initial=16)  # Reduced from 128
+        self.special_size_ctrl = wx.SpinCtrl(self, min=8, max=128, initial=12)  # Reduced from 16
         special_sizer.Add(special_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         special_sizer.Add(self.special_size_ctrl, 0, wx.EXPAND)
         output_sizer.Add(special_sizer, 0, wx.EXPAND | wx.ALL, 5)
@@ -107,7 +107,7 @@ class ModelPanel(wx.Panel):
         # Quantization precision
         precision_sizer = wx.BoxSizer(wx.HORIZONTAL)
         precision_label = wx.StaticText(self, label="Weight Precision (decimal places):")
-        self.precision_ctrl = wx.SpinCtrl(self, min=1, max=16, initial=8)  # Reduced from 3
+        self.precision_ctrl = wx.SpinCtrl(self, min=1, max=16, initial=16)  # Reduced from 3
         precision_sizer.Add(precision_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         precision_sizer.Add(self.precision_ctrl, 0, wx.EXPAND)
         export_sizer.Add(precision_sizer, 0, wx.EXPAND | wx.ALL, 5)
@@ -164,17 +164,17 @@ class ModelPanel(wx.Panel):
         network_config = self.config.get('network_config', {})
         
         # Update observation dimension
-        self.input_dim_ctrl.SetValue(network_config.get('observation_dim', 27))
+        self.input_dim_ctrl.SetValue(network_config.get('observation_dim', 48))
         
         # Update hidden layers
         hidden_layers = network_config.get('hidden_layers', [
-            {'type': 'Linear+ReLU', 'size': 32},
-            {'type': 'Linear+ReLU', 'size': 32}
+            {'type': 'Linear+ReLU', 'size': 24},
+            {'type': 'Linear+ReLU', 'size': 16}
         ])
         
         # Ensure we have at least one hidden layer
         if len(hidden_layers) == 0:
-            hidden_layers = [{'type': 'Linear+ReLU', 'size': 32}]
+            hidden_layers = [{'type': 'Linear+ReLU', 'size': 24}]
         
         # Resize grid if needed
         current_rows = self.layers_grid.GetNumberRows()
@@ -188,20 +188,20 @@ class ModelPanel(wx.Panel):
         # Update grid values
         for i, layer in enumerate(hidden_layers):
             self.layers_grid.SetCellValue(i, 0, layer.get('type', 'Linear+ReLU'))
-            self.layers_grid.SetCellValue(i, 1, str(layer.get('size', 32)))
+            self.layers_grid.SetCellValue(i, 1, str(layer.get('size', 24)))
             
             # Set cell editor for layer type
             layer_types = ["Linear", "Linear+ReLU", "Linear+Tanh", "Linear+Sigmoid"]
             self.layers_grid.SetCellEditor(i, 0, wx.grid.GridCellChoiceEditor(layer_types))
         
         # Update head sizes
-        self.policy_size_ctrl.SetValue(network_config.get('policy_hidden_size', 16))
-        self.value_size_ctrl.SetValue(network_config.get('value_hidden_size', 16))
-        self.special_size_ctrl.SetValue(network_config.get('special_hidden_size', 16))
+        self.policy_size_ctrl.SetValue(network_config.get('policy_hidden_size', 12))
+        self.value_size_ctrl.SetValue(network_config.get('value_hidden_size', 12))
+        self.special_size_ctrl.SetValue(network_config.get('special_hidden_size', 12))
         
         # Update export settings
         export_config = self.config.get('export_config', {})
-        self.precision_ctrl.SetValue(export_config.get('precision', 2))
+        self.precision_ctrl.SetValue(export_config.get('precision', 16))
         
         # Update size estimation
         self.update_size_estimation()
@@ -229,7 +229,7 @@ class ModelPanel(wx.Panel):
         
         # Ensure we have at least one hidden layer
         if len(hidden_layers) == 0:
-            hidden_layers = [{'type': 'Linear+ReLU', 'size': 32}]
+            hidden_layers = [{'type': 'Linear+ReLU', 'size': 24}]
         
         # Get head sizes
         policy_hidden_size = self.policy_size_ctrl.GetValue()
@@ -385,9 +385,9 @@ class ModelPanel(wx.Panel):
         
         # Check if the model is likely to fit within the character limit
         _, estimated_size = self.calculate_model_size()
-        if estimated_size > 10000:
+        if estimated_size > 100000:
             result = wx.MessageBox(
-                f"The estimated model size ({estimated_size/1000:.2f} KB) exceeds the 10,000 character limit for CodinGame. "
+                f"The estimated model size ({estimated_size/1000:.2f} KB) exceeds the 100,000 character limit for CodinGame. "
                 "The model may not export correctly. Do you want to continue?",
                 "Size Warning",
                 wx.YES_NO | wx.ICON_WARNING
@@ -488,15 +488,15 @@ class VisualizationPanel(wx.Panel):
         if not self.network_config:
             return 0
             
-        observation_dim = self.network_config.get('observation_dim', 27)
+        observation_dim = self.network_config.get('observation_dim', 48)
         hidden_layers = self.network_config.get('hidden_layers', [])
-        policy_hidden_size = self.network_config.get('policy_hidden_size', 32)
-        value_hidden_size = self.network_config.get('value_hidden_size', 32)
-        special_hidden_size = self.network_config.get('special_hidden_size', 32)
+        policy_hidden_size = self.network_config.get('policy_hidden_size', 12)
+        value_hidden_size = self.network_config.get('value_hidden_size', 12)
+        special_hidden_size = self.network_config.get('special_hidden_size', 12)
         
         # Ensure we have at least one hidden layer for calculation
         if len(hidden_layers) == 0:
-            hidden_layers = [{'size': 32}]
+            hidden_layers = [{'size': 12}]
         
         # Calculate parameters
         total_params = 0
@@ -504,13 +504,13 @@ class VisualizationPanel(wx.Panel):
         # Encoder layers
         input_size = observation_dim
         for layer in hidden_layers:
-            layer_size = layer.get('size', 32)
+            layer_size = layer.get('size', 12)
             # Weights + biases
             total_params += (input_size * layer_size) + layer_size
             input_size = layer_size
         
         # Last hidden layer size
-        last_hidden_size = hidden_layers[-1].get('size', 32) if hidden_layers else observation_dim
+        last_hidden_size = hidden_layers[-1].get('size', 12) if hidden_layers else observation_dim
         
         # Policy head
         total_params += (last_hidden_size * policy_hidden_size) + policy_hidden_size  # First layer
@@ -587,11 +587,11 @@ class VisualizationPanel(wx.Panel):
         from ..models.neural_pod import PodNetwork
         
         network = PodNetwork(
-            observation_dim=network_config.get('observation_dim', 27),
+            observation_dim=network_config.get('observation_dim', 41),
             hidden_layers=network_config.get('hidden_layers', []),
-            policy_hidden_size=network_config.get('policy_hidden_size', 16),
-            value_hidden_size=network_config.get('value_hidden_size', 16),
-            special_hidden_size=network_config.get('special_hidden_size', 16)
+            policy_hidden_size=network_config.get('policy_hidden_size', 12),
+            value_hidden_size=network_config.get('value_hidden_size', 12),
+            special_hidden_size=network_config.get('special_hidden_size', 12)
         )
         
         return network

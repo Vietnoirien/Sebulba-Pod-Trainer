@@ -96,7 +96,7 @@ This project uses **Proximal Policy Optimization (PPO)**, a state-of-the-art pol
 - **Checkpoint-based reward system** encouraging race completion
 - **Multi-agent support** with 4 pods (2 per player)
 
-### Observation Space (27 dimensions)
+### Observation Space (41 dimensions)
 - Pod position and velocity (normalized)
 - Relative positions to next/future checkpoints
 - Opponent pod positions and velocities

@@ -13,6 +13,7 @@ from torch.amp.autocast_mode import autocast
 
 
 from ..environment.race_env import RaceEnvironment
+from ..environment.optimized_race_env import OptimizedRaceEnvironment
 from .trainer import PPOTrainer
 from .optimized_trainer import OptimizedPPOTrainer
 
@@ -71,11 +72,28 @@ class ParallelPPOTrainer:
             for i in range(len(env_indices)):
                 try:
                     env_config_copy = deepcopy(env_config)
-                    env_config_copy['device'] = device  # Ensure environment uses the correct device
+                    
+                    # Remove use_optimized_env from config before passing to environment constructor
+                    use_optimized_env = env_config_copy.pop('use_optimized_env', True)
+                    
+                    # Set device for this environment
+                    env_config_copy['device'] = device
+                    
                     print(f"Creating environment {i} on device {device} with config: {env_config_copy}")
-                    env = RaceEnvironment(**env_config_copy)
+                    print(f"Using optimized environment: {use_optimized_env}")
+                    
+                    # Choose environment class based on use_optimized_env flag
+                    if use_optimized_env:
+                        from ..environment.optimized_race_env import OptimizedRaceEnvironment
+                        env = OptimizedRaceEnvironment(**env_config_copy)
+                        print(f"Successfully created OptimizedRaceEnvironment {i} on device {device}")
+                    else:
+                        from ..environment.race_env import RaceEnvironment
+                        env = RaceEnvironment(**env_config_copy)
+                        print(f"Successfully created RaceEnvironment {i} on device {device}")
+                    
                     envs.append(env)
-                    print(f"Successfully created environment {i} on device {device}")
+                    
                 except Exception as e:
                     print(f"Error creating environment {i} on device {device}: {e}")
                     raise
@@ -109,10 +127,16 @@ class ParallelPPOTrainer:
             
             print(f"Creating trainer on device {device} with batch_size={trainer_init_args['batch_size']}")
             
-            # Create trainer with the first environment
+            # Create trainer with the first environment - choose trainer type based on environment type
             try:
-                trainer = OptimizedPPOTrainer(envs[0], **trainer_init_args)
-                print(f"Successfully created trainer on device {device}")
+                if use_optimized_env:
+                    from ..training.optimized_trainer import OptimizedPPOTrainer
+                    trainer = OptimizedPPOTrainer(envs[0], **trainer_init_args)
+                    print(f"Successfully created OptimizedPPOTrainer on device {device}")
+                else:
+                    from ..training.trainer import PPOTrainer
+                    trainer = PPOTrainer(envs[0], **trainer_init_args)
+                    print(f"Successfully created PPOTrainer on device {device}")
             except Exception as e:
                 print(f"Error creating trainer on device {device}: {e}")
                 raise

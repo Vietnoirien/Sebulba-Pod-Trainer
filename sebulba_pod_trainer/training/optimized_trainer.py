@@ -15,7 +15,7 @@ class OptimizedPPOTrainer(PPOTrainer):
         observations = self.env.reset()
 
         # Initialize pod trails for visualization
-        if visualization_panel is not None and not hasattr(self, 'pod_trails'):
+        if visualization_panel is not None:
             self.pod_trails = {pod_key: [] for pod_key in self.pod_networks.keys()}
         
         # Pre-allocate tensors for storage to avoid repeated allocations
@@ -54,50 +54,12 @@ class OptimizedPPOTrainer(PPOTrainer):
                     log_probs[pod_key] = log_prob
             
             # Step the environment
-            next_observations, rewards, dones, _ = self.env.step(actions)
+            next_observations, rewards, dones, info = self.env.step(actions)
 
-            # Update pod trails for visualization
-            if visualization_panel is not None and hasattr(self, 'pod_trails'):
-                # Extract positions from observations or info
-                # Most racing envs include position in the observation
-                for pod_key in self.pod_networks.keys():
-                    if pod_key in observations:
-                        # Extract position from observation - assuming x, y are first 2 values
-                        pos = observations[pod_key][0, 0:2].tolist()
-                        if not hasattr(self, 'pod_trails'):
-                            self.pod_trails = {pk: [] for pk in self.pod_networks.keys()}
-                        self.pod_trails[pod_key].append(pos)
-                        # Keep trail length manageable
-                        if len(self.pod_trails[pod_key]) > 50:
-                            self.pod_trails[pod_key] = self.pod_trails[pod_key][-50:]
+            # Send race state to visualization
+            if visualization_panel is not None and step % 10 == 0:  # Every 10 steps
+                self._send_race_state_to_visualization(observations, info, visualization_panel)
             
-            # Send race state to visualization occasionally
-            if visualization_panel is not None and step % 20 == 0:
-                # Create race state for visualization
-                race_state = {
-                    'checkpoints': self.env.get_checkpoints() if hasattr(self.env, 'get_checkpoints') else [],
-                    'pods': []
-                }
-                
-                # Add pod information from observations
-                for pod_key in self.pod_networks.keys():
-                    if pod_key in observations:
-                        # Extract position and angle from observation
-                        # Assuming first 2 values are position, 3rd value is angle
-                        obs = observations[pod_key][0]
-                        position = obs[0:2].tolist()
-                        angle = float(obs[2]) if len(obs) > 2 else 0.0
-                        
-                        pod_info = {
-                            'position': position,
-                            'angle': angle,
-                            'trail': self.pod_trails.get(pod_key, []) if hasattr(self, 'pod_trails') else []
-                        }
-                        
-                        race_state['pods'].append(pod_info)
-            
-            # Send to visualization panel
-            visualization_panel.add_metric({'race_state': race_state})           
             # Store trajectory data
             for pod_key in self.pod_networks.keys():
                 device = next(self.pod_networks[pod_key].parameters()).device
@@ -129,6 +91,51 @@ class OptimizedPPOTrainer(PPOTrainer):
             # Reset environment if all episodes are done
             if isinstance(dones, torch.Tensor) and dones.all():
                 observations = self.env.reset()
+
+    def _send_race_state_to_visualization(self, observations, info, visualization_panel):
+        """Send race state data to visualization panel"""
+        try:
+            # Get checkpoints from environment
+            checkpoints = self.env.get_checkpoints() if hasattr(self.env, 'get_checkpoints') else []
+            
+            # Extract pod positions from environment directly
+            pods = []
+            for pod_idx, pod in enumerate(self.env.pods):
+                # Get position directly from pod object (first batch item)
+                position = pod.position[0].cpu().numpy().tolist()  # Convert to list
+                angle = float(pod.angle[0].cpu().numpy())  # Convert to float
+                
+                pod_info = {
+                    'position': position,
+                    'angle': angle,
+                    'trail': getattr(self, 'pod_trails', {}).get(f'pod_{pod_idx}', [])
+                }
+                pods.append(pod_info)
+                
+                # Update trail
+                if hasattr(self, 'pod_trails'):
+                    trail_key = f'pod_{pod_idx}'
+                    if trail_key not in self.pod_trails:
+                        self.pod_trails[trail_key] = []
+                    self.pod_trails[trail_key].append(position)
+                    # Keep trail length manageable
+                    if len(self.pod_trails[trail_key]) > 50:
+                        self.pod_trails[trail_key] = self.pod_trails[trail_key][-50:]
+            
+            # Create race state
+            race_state = {
+                'checkpoints': checkpoints,
+                'pods': pods,
+                'worker_id': getattr(self, 'worker_id', 'main')
+            }
+            
+            # Send to visualization
+            visualization_panel.add_metric({'race_state': race_state})
+            
+        except Exception as e:
+            print(f"Error sending race state to visualization: {e}")
+            import traceback
+            traceback.print_exc()
     
     def compute_returns_and_advantages(self):
         """Optimized computation of returns and advantages"""

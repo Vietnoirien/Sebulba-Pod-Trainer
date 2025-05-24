@@ -46,14 +46,14 @@ class MainFrame(wx.Frame):
             'use_mixed_precision': True,
             'use_optimized_env': True,  # New option for optimized environment
             'network_config': {
-                'observation_dim': 25,
+                'observation_dim': 41,
                 'hidden_layers': [
-                    {'type': 'Linear+ReLU', 'size': 32},
-                    {'type': 'Linear+ReLU', 'size': 32}
+                    {'type': 'Linear+ReLU', 'size': 24},
+                    {'type': 'Linear+ReLU', 'size': 16}
                 ],
-                'policy_hidden_size': 32,
-                'value_hidden_size': 32,
-                'special_hidden_size': 32
+                'policy_hidden_size': 12,
+                'value_hidden_size': 12,
+                'special_hidden_size': 12
             },
             'use_parallel': False,
             'envs_per_gpu': 8,
@@ -196,21 +196,21 @@ class MainFrame(wx.Frame):
             # Ensure network_config has proper structure
             if 'network_config' not in self.config:
                 self.config['network_config'] = {
-                    'observation_dim': 25,
+                    'observation_dim': 41,
                     'hidden_layers': [
-                        {'type': 'Linear+ReLU', 'size': 32},
-                        {'type': 'Linear+ReLU', 'size': 32}
+                        {'type': 'Linear+ReLU', 'size': 24},
+                        {'type': 'Linear+ReLU', 'size': 16}
                     ],
-                    'policy_hidden_size': 32,
-                    'value_hidden_size': 32,
-                    'special_hidden_size': 32
+                    'policy_hidden_size': 12,
+                    'value_hidden_size': 12,
+                    'special_hidden_size': 12
                 }
             
             # Ensure hidden_layers exists and is not empty
             if 'hidden_layers' not in self.config['network_config'] or len(self.config['network_config']['hidden_layers']) == 0:
                 self.config['network_config']['hidden_layers'] = [
-                    {'type': 'Linear+ReLU', 'size': 32},
-                    {'type': 'Linear+ReLU', 'size': 32}
+                    {'type': 'Linear+ReLU', 'size': 24},
+                    {'type': 'Linear+ReLU', 'size': 16}
                 ]
             
             # Ensure device settings are properly set
@@ -258,14 +258,14 @@ class MainFrame(wx.Frame):
                 'use_mixed_precision': True,
                 'use_optimized_env': True,  # Default to optimized environment
                 'network_config': {
-                    'observation_dim': 27,
+                    'observation_dim': 41,
                     'hidden_layers': [
-                        {'type': 'Linear+ReLU', 'size': 32},
-                        {'type': 'Linear+ReLU', 'size': 32}
+                        {'type': 'Linear+ReLU', 'size': 24},
+                        {'type': 'Linear+ReLU', 'size': 16}
                     ],
-                    'policy_hidden_size': 32,
-                    'value_hidden_size': 32,
-                    'special_hidden_size': 32
+                    'policy_hidden_size': 12,
+                    'value_hidden_size': 12,
+                    'special_hidden_size': 12
                 }
             }
             
@@ -421,6 +421,7 @@ class MainFrame(wx.Frame):
             
             print(f"Training config: {training_config}")
             print(f"Network config in run_training: {training_config.get('network_config', {})}")
+            print(f"Use optimized env: {training_config.get('use_optimized_env', True)}")
             
             # Ensure critical parameters exist
             if 'num_iterations' not in training_config:
@@ -455,7 +456,8 @@ class MainFrame(wx.Frame):
                     'batch_size': training_config['batch_size'],
                     # Don't specify device here, let each worker set it
                     'num_checkpoints': training_config.get('num_checkpoints', 3),
-                    'laps': training_config.get('laps', 3)
+                    'laps': training_config.get('laps', 3),
+                    'use_optimized_env': training_config.get('use_optimized_env', True)
                 }
                 
                 print(f"Environment config: {env_config}")
@@ -495,8 +497,21 @@ class MainFrame(wx.Frame):
                     for key, value in training_config['ppo_params'].items():
                         trainer_args[key] = value
 
-                # Add network configuration
-                trainer_args['network_config'] = training_config.get('network_config', {})
+                # FIXED: Use the user-configured network config without overriding observation_dim
+                network_config = training_config.get('network_config', {}).copy()
+                
+                # Only set default observation_dim if it's not already configured by the user
+                if 'observation_dim' not in network_config:
+                    if training_config.get('use_optimized_env', True):
+                        network_config['observation_dim'] = 47  # OptimizedRaceEnvironment default
+                        print("No observation_dim configured - using OptimizedRaceEnvironment default: 47")
+                    else:
+                        network_config['observation_dim'] = 41  # Standard RaceEnvironment default
+                        print("No observation_dim configured - using standard RaceEnvironment default: 41")
+                else:
+                    print(f"Using user-configured observation_dim: {network_config['observation_dim']}")
+                
+                trainer_args['network_config'] = network_config
                 print(f"Network config being passed to parallel trainer: {trainer_args['network_config']}")
 
                 print(f"Final trainer args: {trainer_args}")
@@ -557,8 +572,20 @@ class MainFrame(wx.Frame):
                             device=torch.device(training_config['device'])
                         )
 
-                # Create a custom network using the configuration
-                network_config = training_config.get('network_config', {})
+                # FIXED: Use the user-configured network config without overriding observation_dim
+                network_config = training_config.get('network_config', {}).copy()
+                
+                # Only set default observation_dim if it's not already configured by the user
+                if 'observation_dim' not in network_config:
+                    if training_config.get('use_optimized_env', True):
+                        network_config['observation_dim'] = 47  # OptimizedRaceEnvironment default
+                        print("No observation_dim configured - using OptimizedRaceEnvironment default: 47")
+                    else:
+                        network_config['observation_dim'] = 41  # Standard RaceEnvironment default
+                        print("No observation_dim configured - using standard RaceEnvironment default: 41")
+                else:
+                    print(f"Using user-configured observation_dim: {network_config['observation_dim']}")
+                
                 print(f"Using network config for standard training: {network_config}")
 
                 # Create trainer - use optimized trainer if using optimized environment
@@ -572,7 +599,7 @@ class MainFrame(wx.Frame):
                         multi_gpu=training_config.get('multi_gpu', False),
                         devices=training_config.get('devices', []),
                         use_mixed_precision=training_config.get('use_mixed_precision', True),
-                        network_config=network_config  # Pass the network config
+                        network_config=network_config  # Pass the updated network config
                     )
                 else:
                     print("Creating standard PPOTrainer...")
@@ -584,7 +611,7 @@ class MainFrame(wx.Frame):
                         multi_gpu=training_config.get('multi_gpu', False),
                         devices=training_config.get('devices', []),
                         use_mixed_precision=training_config.get('use_mixed_precision', True),
-                        network_config=network_config  # Pass the network config
+                        network_config=network_config  # Pass the updated network config
                     )
                 
                 # Add PPO parameters if they exist
@@ -612,7 +639,7 @@ class MainFrame(wx.Frame):
             import traceback
             print(f"Exception in run_training: {str(e)}")
             print(traceback.format_exc())
-            wx.CallAfter(self.on_training_error, str(e))    
+            wx.CallAfter(self.on_training_error, str(e))
     def on_training_complete(self):
         self.status_bar.SetStatusText("Training complete", 0)
         wx.MessageBox("Training completed successfully!", "Training Complete", wx.OK | wx.ICON_INFORMATION)
@@ -638,8 +665,8 @@ class MainFrame(wx.Frame):
         info.SetName("Sebulba Pod Trainer")
         info.SetVersion("1.0")
         info.SetDescription("A training application for pod racing AI using reinforcement learning")
-        info.SetCopyright("(C) 2023")
-        info.SetWebSite("https://github.com/yourusername/sebulba_pod_trainer")
+        info.SetCopyright("(C) 2025 Vietnoirien")
+        info.SetWebSite("https://github.com/Vietnoirien/Sebulba-Pod-Trainer")
         
         wx.adv.AboutBox(info)
     
