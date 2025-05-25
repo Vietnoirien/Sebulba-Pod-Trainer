@@ -1298,7 +1298,7 @@ class VisualizationPanel(wx.Panel):
             
             # Run race
             done = False
-            max_steps = 200  # Limit steps to avoid infinite loops
+            max_steps = 1000  # Limit steps to avoid infinite loops
             
             for step in range(max_steps):
                 if done:
@@ -1342,6 +1342,7 @@ class VisualizationPanel(wx.Panel):
 
                     # Update visualization
                     wx.CallAfter(self.update_race_visualization_throttled, race_state, 'visualization')
+                    print(f"Updated visualization at step {step}")
                     
                     # Small delay to make visualization visible
                     time.sleep(0.1) 

@@ -812,7 +812,7 @@ class ModelExporter:
         code.append("")
         
         # Convert outputs to game commands
-        code.append("        # Convert angle output to target coordinates")
+        code.append("        # Convert model outputs to action format")
         code.append("        x, y, vx, vy, angle, next_checkpoint_id = pod_data_all[pod_id]")
         code.append("        next_checkpoint_x, next_checkpoint_y = checkpoints[next_checkpoint_id]")
         code.append("        ")
@@ -830,9 +830,9 @@ class ModelExporter:
         code.append("        target_x = x + math.cos(target_angle_rad) * target_distance")
         code.append("        target_y = y + math.sin(target_angle_rad) * target_distance")
         code.append("")
-        
-        # Determine thrust value
-        code.append("        # Determine thrust")
+
+        # Determine thrust value - CORRECTED VERSION
+        code.append("        # Convert special actions to thrust_value format (matching environment)")
         code.append("        if shield_prob > 0.5:")
         code.append("            thrust_command = 'SHIELD'")
         code.append("        elif boost_prob > 0.5 and not boost_used[pod_id]:")
@@ -840,9 +840,8 @@ class ModelExporter:
         code.append("            boost_used[pod_id] = True")
         code.append("        else:")
         code.append("            thrust_value = max(0, min(100, int(thrust * 100)))")
-        code.append("            thrust_command = str(thrust_value)")
-        code.append("")
-        
+        code.append("           thrust_command = str(thrust_value)")
+
         # Store command for this pod
         code.append("        # Store command for this pod")
         code.append("        commands.append(f\"{int(target_x)} {int(target_y)} {thrust_command}\")")

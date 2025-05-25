@@ -180,7 +180,7 @@ class ParallelPPOTrainer:
             # Extract training parameters from trainer_args
             training_args = {
                 'num_iterations': trainer_args.get('num_iterations', 1000),
-                'steps_per_iteration': trainer_args.get('steps_per_iteration', 128),
+                'steps_per_iteration': trainer_args.get('steps_per_iteration', 600),
                 'save_interval': trainer_args.get('save_interval', 50),
                 'save_dir': trainer_args.get('save_dir', 'trained_models')
             }
@@ -242,77 +242,65 @@ class ParallelPPOTrainer:
                         print(f"GPU {gpu_id} - Error updating shared models: {e}")
             
             def aggregate_gradients():
-                """Aggregate gradients across workers"""
-                if gradient_aggregation and shared_metrics is not None:
-                    try:
-                        # Store gradients in shared metrics for aggregation
-                        gradient_key = f"gradients_gpu_{gpu_id}"
-                        shared_metrics[gradient_key] = {}
-                        
+                """Aggregate gradients across workers with robust error handling"""
+                nonlocal gradient_aggregation
+                
+                if not gradient_aggregation or shared_metrics is None:
+                    return
+                    
+                try:
+                    # Store gradients in shared metrics for aggregation
+                    gradient_key = f"gradients_gpu_{gpu_id}"
+                    
+                    # Create a simple flat dictionary to avoid nested assignment issues
+                    flat_gradients = {}
+                    for pod_key, network in trainer.pod_networks.items():
+                        for name, param in network.named_parameters():
+                            if param.grad is not None:
+                                # Use a flat key structure: "pod_key::param_name"
+                                flat_key = f"{pod_key}::{name}"
+                                flat_gradients[flat_key] = param.grad.cpu()
+                    
+                    # Store the flat structure
+                    shared_metrics[gradient_key] = flat_gradients
+                    
+                    # Wait for other workers
+                    time.sleep(0.3)
+                    
+                    # Check if we have gradients from all workers
+                    gradient_keys = [k for k in shared_metrics.keys() if k.startswith("gradients_gpu_")]
+                    if len(gradient_keys) >= num_gpus:
+                        # Average gradients
                         for pod_key, network in trainer.pod_networks.items():
-                            shared_metrics[gradient_key][pod_key] = {}
                             for name, param in network.named_parameters():
                                 if param.grad is not None:
-                                    shared_metrics[gradient_key][pod_key][name] = param.grad.cpu()
+                                    flat_key = f"{pod_key}::{name}"
+                                    grad_sum = torch.zeros_like(param.grad)
+                                    count = 0
+                                    
+                                    for grad_worker_key in gradient_keys:
+                                        try:
+                                            worker_gradients = shared_metrics.get(grad_worker_key, {})
+                                            if flat_key in worker_gradients:
+                                                grad_tensor = worker_gradients[flat_key].to(device)
+                                                grad_sum += grad_tensor
+                                                count += 1
+                                        except Exception:
+                                            continue
+                                    
+                                    if count > 0:
+                                        param.grad = grad_sum / count
                         
-                        # Wait for other workers and average gradients
-                        time.sleep(0.2)  # Increased delay to ensure all workers update
-                        
-                        # Check if we have gradients from all workers
-                        gradient_keys = [k for k in shared_metrics.keys() if k.startswith("gradients_gpu_")]
-                        if len(gradient_keys) >= num_gpus:
-                            # Average gradients
-                            for pod_key, network in trainer.pod_networks.items():
-                                for name, param in network.named_parameters():
-                                    if param.grad is not None:
-                                        grad_sum = torch.zeros_like(param.grad)
-                                        count = 0
-                                        
-                                        for grad_key in gradient_keys:
-                                            # Add safety checks for nested dictionary access
-                                            if (grad_key in shared_metrics and 
-                                                isinstance(shared_metrics[grad_key], dict) and
-                                                pod_key in shared_metrics[grad_key] and 
-                                                isinstance(shared_metrics[grad_key][pod_key], dict) and
-                                                name in shared_metrics[grad_key][pod_key]):
-                                                try:
-                                                    grad_tensor = shared_metrics[grad_key][pod_key][name].to(device)
-                                                    grad_sum += grad_tensor
-                                                    count += 1
-                                                except Exception as tensor_error:
-                                                    print(f"GPU {gpu_id} - Error loading gradient tensor for {pod_key}.{name}: {tensor_error}")
-                                                    continue
-                                        
-                                        if count > 0:
-                                            param.grad = grad_sum / count
-                            
-                            # Clear gradient storage with safety checks
-                            gradient_keys_to_remove = []
-                            for grad_key in gradient_keys:
-                                if grad_key in shared_metrics:
-                                    gradient_keys_to_remove.append(grad_key)
-                            
-                            for grad_key in gradient_keys_to_remove:
-                                try:
-                                    del shared_metrics[grad_key]
-                                except KeyError:
-                                    # Key might have been deleted by another worker
-                                    pass
-                    
-                    except Exception as e:
-                        print(f"GPU {gpu_id} - Error aggregating gradients: {e}")
-                        # Print more detailed error information
-                        import traceback
-                        print(f"GPU {gpu_id} - Gradient aggregation traceback: {traceback.format_exc()}")
-                        
-                        # Print available keys for debugging
-                        try:
-                            available_keys = list(shared_metrics.keys()) if shared_metrics else []
-                            gradient_keys = [k for k in available_keys if k.startswith("gradients_gpu_")]
-                            print(f"GPU {gpu_id} - Available gradient keys: {gradient_keys}")
-                            print(f"GPU {gpu_id} - Available pod keys in trainer: {list(trainer.pod_networks.keys())}")
-                        except Exception as debug_error:
-                            print(f"GPU {gpu_id} - Error in debug output: {debug_error}")
+                        # Clear gradient storage
+                        for grad_key in list(gradient_keys):
+                            try:
+                                del shared_metrics[grad_key]
+                            except (KeyError, TypeError):
+                                pass
+                
+                except Exception as e:
+                    print(f"GPU {gpu_id} - Gradient aggregation disabled due to error: {e}")
+                    gradient_aggregation = False
             
             def coordinate_learning_rates(avg_reward):
                 """Coordinate learning rates based on global performance"""
@@ -439,7 +427,7 @@ class ParallelPPOTrainer:
             trainer._update_pod = update_pod_with_nan_check
             
             # Override parallel_collect_trajectories with improved device handling and NaN checking
-            def parallel_collect_trajectories(num_steps=128):
+            def parallel_collect_trajectories(num_steps=600):
                 # Reset storage
                 trainer.reset_storage()
                 

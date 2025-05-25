@@ -23,7 +23,7 @@ class OptimizedRaceEnvironment:
                 device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
                 randomize_checkpoints: bool = True,
                 min_checkpoints: int = 3,
-                max_checkpoints: int = 6):
+                max_checkpoints: int = 8):
         self.device = device
         self.batch_size = batch_size
         self.base_num_checkpoints = num_checkpoints
@@ -295,8 +295,15 @@ class OptimizedRaceEnvironment:
         
         for b in range(self.batch_size):
             num_cp = self.batch_checkpoint_counts[b].item()
-            next_cp_idx[b] = pod.current_checkpoint[b] % num_cp
-            next_next_cp_idx[b] = (pod.current_checkpoint[b] + 1) % num_cp
+            total_cp = num_cp * self.laps
+            
+            if pod.current_checkpoint[b] < total_cp:
+                next_cp_idx[b] = pod.current_checkpoint[b] % num_cp
+                next_next_cp_idx[b] = (pod.current_checkpoint[b] + 1) % num_cp
+            else:
+                # Race finished, use last checkpoint
+                next_cp_idx[b] = (num_cp - 1)
+                next_next_cp_idx[b] = (num_cp - 1)
         
         # Get next checkpoint positions (vectorized)
         next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
@@ -482,12 +489,21 @@ class OptimizedRaceEnvironment:
                 
                 # Apply normal thrust
                 if normal_thrust_mask.any():
-                    # Convert normalized thrust [0, 1] to game thrust [0, 100]
-                    # Use in-place operations for efficiency
-                    full_thrust = torch.zeros_like(thrust_value)
-                    thrust = torch.round(thrust_value[normal_thrust_mask] * 100)
-                    full_thrust[normal_thrust_mask] = thrust
-                    pod.apply_thrust(full_thrust)
+                    # Check shield cooldown - pods can't thrust while shield is cooling down
+                    can_thrust_mask = pod.shield_cooldown == 0
+
+                    # Fix: Ensure both masks have the same shape before combining
+                    can_thrust_mask_squeezed = can_thrust_mask.squeeze(-1)  # Remove last dimension to match normal_thrust_mask
+                    normal_thrust_mask_squeezed = normal_thrust_mask.squeeze(-1)  # Ensure consistent shape
+                    final_thrust_mask = normal_thrust_mask_squeezed & can_thrust_mask_squeezed
+
+                    if final_thrust_mask.any():
+                        # Convert normalized thrust [0, 1] to game thrust [0, 100]
+                        full_thrust = torch.zeros_like(thrust_value)
+                        thrust_masked = thrust_value[final_thrust_mask.unsqueeze(-1)]
+                        thrust = torch.round(thrust_masked)
+                        full_thrust[final_thrust_mask.unsqueeze(-1)] = thrust
+                        pod.apply_thrust(full_thrust)
         
         # Move pods and handle collisions
         self._simulate_movement()
@@ -608,13 +624,26 @@ class OptimizedRaceEnvironment:
             
             for b in range(self.batch_size):
                 num_cp = self.batch_checkpoint_counts[b].item()
-                next_cp_idx = pod.current_checkpoint[b] % num_cp
-                next_cp_positions[b] = self.checkpoints[b, next_cp_idx]
+                total_cp = num_cp * self.laps
+                
+                # Only check checkpoints if race isn't finished for this pod
+                if pod.current_checkpoint[b] < total_cp:
+                    next_cp_idx = pod.current_checkpoint[b] % num_cp
+                    next_cp_positions[b] = self.checkpoints[b, next_cp_idx]
+                else:
+                    # Race finished, set dummy position (won't be used)
+                    next_cp_positions[b] = self.checkpoints[b, 0]
             
-            # Check distances to next checkpoints
+            # Check distances to next checkpoints only for unfinished races
             diff = pod.position - next_cp_positions
             distances = torch.norm(diff, dim=1)
-            reached = distances <= 600  # Checkpoint radius
+            
+            # Create mask for pods that haven't finished the race
+            batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
+            not_finished = pod.current_checkpoint.squeeze() < batch_total_checkpoints
+            
+            # Only check checkpoint collision for unfinished pods
+            reached = (distances <= 600) & not_finished  # Checkpoint radius
             
             # Update checkpoint counters and last checkpoint turn
             if reached.any():
@@ -644,7 +673,8 @@ class OptimizedRaceEnvironment:
         """Update race status - updated for variable checkpoint counts"""
         new_done = torch.zeros_like(self.done)
         
-        # Calculate total checkpoints per batch
+        # Calculate total checkpoints per batch 
+        # We need to complete all laps AND cross the finish line (checkpoint 0) one final time
         batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
         
         # Check if any pod has completed all checkpoints
@@ -652,8 +682,9 @@ class OptimizedRaceEnvironment:
             player_pods = [self.pods[player_idx*2], self.pods[player_idx*2+1]]
             
             for pod in player_pods:
-                # Check if pod has completed all checkpoints (batch-specific)
-                race_completed = pod.current_checkpoint.squeeze() >= batch_total_checkpoints
+                # Check if pod has completed all checkpoints including final finish line crossing
+                # For 3 CP, 3 laps: need to reach checkpoint 10 (crossed finish line after lap 3)
+                race_completed = pod.current_checkpoint.squeeze() > batch_total_checkpoints
                 new_done = new_done | race_completed
         
         # Check for timeout (unchanged)

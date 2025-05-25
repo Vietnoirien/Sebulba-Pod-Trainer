@@ -11,7 +11,7 @@ class VisualizationConnector:
         self.visualization_panel = visualization_panel
         self.active = False
         self.worker_data = {}
-        self.metrics_buffer = defaultdict(lambda: deque(maxlen=100))  # Reduced buffer size
+        self.metrics_buffer = defaultdict(lambda: deque(maxlen=1000))  # Reduced buffer size
         self.race_state_buffer = {}
         self.last_update_time = defaultdict(float)
         self.update_frequency = 2.0  # Reduced frequency: Update visualization every 2 seconds

@@ -510,7 +510,7 @@ while True:
         else:  # Blocker
             angle_output, thrust, shield_prob, boost_prob = blocker_forward(obs)
 
-        # Convert angle output to target coordinates
+        # Convert model outputs to action format
         x, y, vx, vy, angle, next_checkpoint_id = pod_data_all[pod_id]
         next_checkpoint_x, next_checkpoint_y = checkpoints[next_checkpoint_id]
         
@@ -528,7 +528,7 @@ while True:
         target_x = x + math.cos(target_angle_rad) * target_distance
         target_y = y + math.sin(target_angle_rad) * target_distance
 
-        # Determine thrust
+        # Convert special actions to thrust_value format (matching environment)
         if shield_prob > 0.5:
             thrust_command = 'SHIELD'
         elif boost_prob > 0.5 and not boost_used[pod_id]:
@@ -536,8 +536,7 @@ while True:
             boost_used[pod_id] = True
         else:
             thrust_value = max(0, min(100, int(thrust * 100)))
-            thrust_command = str(thrust_value)
-
+        thrust_command = str(thrust_value)
         # Store command for this pod
         commands.append(f"{int(target_x)} {int(target_y)} {thrust_command}")
 
