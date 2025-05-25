@@ -612,6 +612,23 @@ class OptimizedRaceEnvironment:
                 pod.current_checkpoint[reached] += 1
                 self.last_checkpoint_turn[reached, pod_idx] = self.turn_count[reached].squeeze()
 
+    def _get_next_checkpoint_positions(self) -> Dict[int, torch.Tensor]:
+        """Get next checkpoint positions for all pods"""
+        next_cp_positions = {}
+        
+        for pod_idx, pod in enumerate(self.pods):
+            # Get batch-specific next checkpoint positions
+            positions = torch.zeros(self.batch_size, 2, device=self.device)
+            
+            for b in range(self.batch_size):
+                num_cp = self.batch_checkpoint_counts[b].item()
+                next_cp_idx = pod.current_checkpoint[b] % num_cp
+                positions[b] = self.checkpoints[b, next_cp_idx]
+            
+            next_cp_positions[pod_idx] = positions
+        
+        return next_cp_positions
+
     def _update_race_status(self) -> None:
         """Update race status - updated for variable checkpoint counts"""
         new_done = torch.zeros_like(self.done)

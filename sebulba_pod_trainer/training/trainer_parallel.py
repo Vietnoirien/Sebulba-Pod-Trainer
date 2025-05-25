@@ -531,37 +531,57 @@ class ParallelPPOTrainer:
                     # Check for NaN in network parameters after update
                     check_and_fix_network_parameters()
                     
-                    # Calculate average reward
-                    avg_reward = 0
+                    # Calculate elapsed time since start of iteration
+                    elapsed_time = time.time() - start_time
+                    
+                    # Calculate role-specific average rewards
+                    runner_reward = 0
+                    blocker_reward = 0
+                    runner_count = 0
+                    blocker_count = 0
+
                     for pod_key in trainer.pod_networks.keys():
                         if 'rewards' in trainer.storage[pod_key]:
                             rewards = torch.cat([r for r in trainer.storage[pod_key]['rewards']])
-                            avg_reward += rewards.mean().item()
-                    
-                    avg_reward /= len(trainer.pod_networks)
-                    
-                    # Reset storage for next iteration
-                    trainer.reset_storage()
-                    
-                    # Log progress
-                    elapsed_time = time.time() - start_time
-                    print(f"GPU {gpu_id} - Iteration {iteration}/{training_args['num_iterations']} completed in {elapsed_time:.2f}s, "
-                        f"avg_reward={avg_reward:.4f}, policy_loss={policy_loss:.4f}, value_loss={value_loss:.4f}, lr={current_lr:.6f}")
-                    
-                    # Log metrics to file
+                            avg_pod_reward = rewards.mean().item()
+                            
+                            # Determine if this is a runner or blocker
+                            if 'pod0' in pod_key:  # Runner
+                                runner_reward += avg_pod_reward
+                                runner_count += 1
+                            elif 'pod1' in pod_key:  # Blocker
+                                blocker_reward += avg_pod_reward
+                                blocker_count += 1
+
+                    avg_runner_reward = runner_reward / max(1, runner_count)
+                    avg_blocker_reward = blocker_reward / max(1, blocker_count)
+                    avg_total_reward = (runner_reward + blocker_reward) / max(1, runner_count + blocker_count)
+
+                    # Log progress with role-specific information
+                    print(f"GPU {gpu_id} - Iteration {iteration}/{training_args['num_iterations']} completed in {elapsed_time:.2f}s")
+                    print(f"  Total reward: {avg_total_reward:.4f}")
+                    print(f"  Runner reward: {avg_runner_reward:.4f}")
+                    print(f"  Blocker reward: {avg_blocker_reward:.4f}")
+                    print(f"  Policy loss: {policy_loss:.4f}, Value loss: {value_loss:.4f}, lr={current_lr:.6f}")
+
+                    # Log metrics to file with role breakdown
                     with open(log_file, 'a') as f:
-                        f.write(f"iteration={iteration},reward={avg_reward:.4f},policy_loss={policy_loss:.4f},"
-                                f"value_loss={value_loss:.4f},time={elapsed_time:.2f},lr={current_lr:.6f}\n")
-                    
-                    # Send metrics to visualization if enabled
+                        f.write(f"iteration={iteration},total_reward={avg_total_reward:.4f},"
+                            f"runner_reward={avg_runner_reward:.4f},blocker_reward={avg_blocker_reward:.4f},"
+                            f"policy_loss={policy_loss:.4f},value_loss={value_loss:.4f},"
+                            f"time={elapsed_time:.2f},lr={current_lr:.6f}\n")
+
+                    # Send enhanced metrics to visualization if enabled
                     if vis_queue is not None:
                         metrics = {
                             'iteration': iteration,
-                            'reward': avg_reward,
+                            'total_reward': avg_total_reward,
+                            'runner_reward': avg_runner_reward,
+                            'blocker_reward': avg_blocker_reward,
                             'policy_loss': policy_loss,
                             'value_loss': value_loss,
                             'learning_rate': current_lr,
-                            'worker_id': f"gpu_{gpu_id}"  # Include worker ID to differentiate metrics
+                            'worker_id': f"gpu_{gpu_id}"
                         }
                         vis_queue.put(metrics)
                         print(f"GPU {gpu_id} sent metrics for iteration {iteration}")

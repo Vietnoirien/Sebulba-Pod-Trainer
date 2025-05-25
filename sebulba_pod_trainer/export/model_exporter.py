@@ -44,7 +44,7 @@ class ModelExporter:
             if first_layer_weight is not None:
                 observation_dim = first_layer_weight.shape[1]
             else:
-                observation_dim = 48  # Default fallback
+                observation_dim = 56  # Default fallback
             
             # Infer hidden layers from encoder - improved detection
             hidden_layers = []
@@ -108,7 +108,7 @@ class ModelExporter:
             print(f"Error inferring network config from {model_path}: {e}")
             # Return a more conservative default config
             return {
-                'observation_dim': 48,  # Updated default
+                'observation_dim': 56,  # Updated default
                 'hidden_layers': [
                     {'type': 'Linear+ReLU', 'size': 24},
                     {'type': 'Linear+ReLU', 'size': 16}
@@ -164,7 +164,7 @@ class ModelExporter:
         try:
             # Create model with inferred config
             model = PodNetwork(
-                observation_dim=config.get('observation_dim', 48),
+                observation_dim=config.get('observation_dim', 56),
                 hidden_layers=config.get('hidden_layers', []),
                 policy_hidden_size=config.get('policy_hidden_size', 12),
                 value_hidden_size=config.get('value_hidden_size', 12),
@@ -191,7 +191,7 @@ class ModelExporter:
                 adapted_config = self._adapt_config_to_state_dict(state_dict, config)
                 
                 model = PodNetwork(
-                    observation_dim=adapted_config.get('observation_dim', 48),
+                    observation_dim=adapted_config.get('observation_dim', 56),
                     hidden_layers=adapted_config.get('hidden_layers', []),
                     policy_hidden_size=adapted_config.get('policy_hidden_size', 12),
                     value_hidden_size=adapted_config.get('value_hidden_size', 12),
@@ -257,37 +257,7 @@ class ModelExporter:
             elif 'player0_pod1' in model_files and self.runner_model is None:
                 print("Using blocker model for runner pod as well")
                 self.runner_model = self.blocker_model
-    
-    def validate_models(self):
-        """Validate that models are properly loaded and compatible for export"""
-        issues = []
-        
-        if self.runner_model is None:
-            issues.append("Runner model is not loaded")
-        
-        if self.blocker_model is None:
-            issues.append("Blocker model is not loaded")
-        
-        if self.runner_model is not None:
-            try:
-                # Test forward pass with dummy input
-                dummy_input = torch.randn(1, self.network_config.get('observation_dim', 48))
-                with torch.no_grad():
-                    self.runner_model(dummy_input)
-            except Exception as e:
-                issues.append(f"Runner model forward pass failed: {e}")
-        
-        if self.blocker_model is not None and self.blocker_model != self.runner_model:
-            try:
-                # Test forward pass with dummy input
-                dummy_input = torch.randn(1, self.network_config.get('observation_dim', 48))
-                with torch.no_grad():
-                    self.blocker_model(dummy_input)
-            except Exception as e:
-                issues.append(f"Blocker model forward pass failed: {e}")
-        
-        return issues
-    
+      
     def _find_best_model_file(self, pod_name):
         """Find the best model file for a pod using various naming patterns"""
         # First try standard filename
@@ -562,7 +532,7 @@ class ModelExporter:
         return code
       
     def _generate_observation_code(self):
-        """Generate code for processing observations to match training environment (48 dimensions)"""
+        """Generate code for processing observations to match training environment (56 dimensions)"""
         code = []
         
         code.append("def get_observations(pod_data, opponent_data, checkpoints, boost_used, pod_id):")
@@ -584,7 +554,8 @@ class ModelExporter:
         code.append("    obs = []")
         code.append("")
         
-        # Pod-specific observations (18 dimensions) - matching training exactly
+        # Base observations (48 dimensions) - same as before
+        code.append("    # === BASE OBSERVATIONS (48 dimensions) ===")
         code.append("    # 1-2: Normalized position")
         code.append("    norm_x = (x * 2.0 / WIDTH) - 1.0")
         code.append("    norm_y = (y * 2.0 / HEIGHT) - 1.0")
@@ -666,7 +637,7 @@ class ModelExporter:
         code.append("    obs.append(boost_available)")
         code.append("")
         
-        # FIXED: Opponent information (3 opponents × 10 dimensions = 30 dimensions)
+        # Opponent information (30 dimensions)
         code.append("    # Add opponent information (30 dimensions total)")
         code.append("    # Build list of all other pods: teammate + 2 opponents")
         code.append("    all_other_pods = []")
@@ -726,17 +697,82 @@ class ModelExporter:
         code.append("        # 10: Opponent's boost availability (assume available)")
         code.append("        obs.append(1.0)")
         code.append("")
+        # NEW: Role-specific observations (8 dimensions)
+        code.append("    # === ROLE-SPECIFIC OBSERVATIONS (8 dimensions) ===")
+        code.append("    # Role identifier")
+        code.append("    role_id = float(pod_id)  # 0 for runner (pod0), 1 for blocker (pod1)")
+        code.append("    obs.append(role_id)")
+        code.append("")
         
-        code.append("    # Verify we have exactly 48 dimensions")
-        code.append("    # 18 (pod-specific) + 30 (3 opponents × 10) = 48")
-        code.append("    assert len(obs) == 48, f'Expected 48 dimensions, got {len(obs)}'")
+        code.append("    if pod_id == 1:  # Blocker-specific observations")
+        code.append("        # Get teammate (runner) data")
+        code.append("        runner_x, runner_y, runner_vx, runner_vy, runner_angle, runner_next_cp = pod_data_all[0]")
+        code.append("        ")
+        code.append("        # Distance to teammate runner (normalized)")
+        code.append("        runner_distance = math.sqrt((x - runner_x)**2 + (y - runner_y)**2) / 8000.0")
+        code.append("        obs.append(runner_distance)")
+        code.append("        ")
+        code.append("        # Runner's progress relative to blocker")
+        code.append("        progress_diff = (runner_next_cp - next_checkpoint_id) / 5.0")
+        code.append("        progress_diff = max(-1.0, min(1.0, progress_diff))  # Clamp to [-1, 1]")
+        code.append("        obs.append(progress_diff)")
+        code.append("        ")
+        code.append("        # Find closest opponent")
+        code.append("        min_opp_distance = float('inf')")
+        code.append("        closest_opp_x, closest_opp_y = 0, 0")
+        code.append("        for opp_data in opponent_data:")
+        code.append("            opp_x_temp, opp_y_temp = opp_data[0], opp_data[1]")
+        code.append("            opp_distance = math.sqrt((x - opp_x_temp)**2 + (y - opp_y_temp)**2)")
+        code.append("            if opp_distance < min_opp_distance:")
+        code.append("                min_opp_distance = opp_distance")
+        code.append("                closest_opp_x, closest_opp_y = opp_x_temp, opp_y_temp")
+        code.append("        ")
+        code.append("        # Normalized distance to closest opponent")
+        code.append("        closest_opp_distance_norm = min_opp_distance / 8000.0")
+        code.append("        obs.append(closest_opp_distance_norm)")
+        code.append("        ")
+        code.append("        # Relative position to closest opponent (normalized)")
+        code.append("        rel_closest_opp_x = (closest_opp_x - x) / 8000.0")
+        code.append("        rel_closest_opp_y = (closest_opp_y - y) / 8000.0")
+        code.append("        obs.extend([rel_closest_opp_x, rel_closest_opp_y])")
+        code.append("        ")
+        code.append("        # Blocking opportunity score")
+        code.append("        blocking_opportunity = 0.0")
+        code.append("        for opp_data in opponent_data:")
+        code.append("            opp_x_temp, opp_y_temp, _, _, _, opp_next_cp = opp_data")
+        code.append("            # Get opponent's next checkpoint")
+        code.append("            opp_cp_x, opp_cp_y = checkpoints[opp_next_cp]")
+        code.append("            ")
+        code.append("            # Distance from opponent to their checkpoint")
+        code.append("            opp_to_cp_dist = math.sqrt((opp_cp_x - opp_x_temp)**2 + (opp_cp_y - opp_y_temp)**2)")
+        code.append("            # Distance from blocker to opponent's checkpoint")
+        code.append("            blocker_to_cp_dist = math.sqrt((opp_cp_x - x)**2 + (opp_cp_y - y)**2)")
+        code.append("            ")
+        code.append("            # Simple interception opportunity")
+        code.append("            if opp_to_cp_dist > 0:")
+        code.append("                intercept_score = max(0.0, 1.0 - blocker_to_cp_dist / (opp_to_cp_dist + 1e-6))")
+        code.append("                blocking_opportunity += intercept_score")
+        code.append("        ")
+        code.append("        blocking_opportunity = min(1.0, blocking_opportunity / 2.0)  # Normalize")
+        code.append("        obs.append(blocking_opportunity)")
+        code.append("        ")
+        code.append("        # Reserved dimension for future use")
+        code.append("        obs.append(0.0)")
+        code.append("    else:")
+        code.append("        # Runner pod - fill role-specific observations with zeros/defaults")
+        code.append("        obs.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 7 dimensions (role_id already added)")
+        code.append("")
+        
+        code.append("    # Verify we have exactly 56 dimensions")
+        code.append("    # 48 (base) + 8 (role-specific) = 56")
+        code.append("    assert len(obs) == 56, f'Expected 56 dimensions, got {len(obs)}'")
         code.append("    return obs")
         code.append("")
         
         return code
 
     def _generate_main_code(self):
-        """Generate the main game loop code with corrected observation handling"""
+        """Generate the main game loop code with corrected observation handling for 56 dimensions"""
         code = []
         
         # Imports
@@ -782,7 +818,7 @@ class ModelExporter:
         code.append("    # Process each pod and store commands")
         code.append("    commands = []")
         code.append("    for pod_id in range(2):")
-        code.append("        # Get observations (48 dimensions matching training)")
+        code.append("        # Get observations (56 dimensions matching training)")
         code.append("        obs = get_observations(")
         code.append("            pod_data_all[pod_id], ")
         code.append("            opponent_data, ")
@@ -844,6 +880,36 @@ class ModelExporter:
         code.append("")
         
         return code
+
+    def validate_models(self):
+        """Validate that models are properly loaded and compatible for export"""
+        issues = []
+        
+        if self.runner_model is None:
+            issues.append("Runner model is not loaded")
+        
+        if self.blocker_model is None:
+            issues.append("Blocker model is not loaded")
+        
+        if self.runner_model is not None:
+            try:
+                # Test forward pass with dummy input (56 dimensions)
+                dummy_input = torch.randn(1, self.network_config.get('observation_dim', 56))
+                with torch.no_grad():
+                    self.runner_model(dummy_input)
+            except Exception as e:
+                issues.append(f"Runner model forward pass failed: {e}")
+        
+        if self.blocker_model is not None and self.blocker_model != self.runner_model:
+            try:
+                # Test forward pass with dummy input (56 dimensions)
+                dummy_input = torch.randn(1, self.network_config.get('observation_dim', 56))
+                with torch.no_grad():
+                    self.blocker_model(dummy_input)
+            except Exception as e:
+                issues.append(f"Blocker model forward pass failed: {e}")
+        
+        return issues
 
     def export(self, quantize=True, precision=3):
         """

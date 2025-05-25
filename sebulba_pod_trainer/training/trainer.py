@@ -58,14 +58,14 @@ class PPOTrainer:
         # Use network_config if provided, otherwise use defaults
         if self.network_config is None:
             self.network_config = {
-                    'observation_dim': 27,
+                    'observation_dim': 56,
                     'hidden_layers': [
-                        {'type': 'Linear+ReLU', 'size': 32},
-                        {'type': 'Linear+ReLU', 'size': 32}
+                        {'type': 'Linear+ReLU', 'size': 24},
+                        {'type': 'Linear+ReLU', 'size': 16}
                     ],
-                    'policy_hidden_size': 16,
-                    'value_hidden_size': 16,
-                    'special_hidden_size': 16
+                    'policy_hidden_size': 12,
+                    'value_hidden_size': 12,
+                    'special_hidden_size': 12
                 }
             
         # Initialize mixed precision tools if enabled
@@ -119,11 +119,11 @@ class PPOTrainer:
                     gpu_id = pod_device_map[pod_key]
                     # Explicitly create the network on the specific GPU
                     network = PodNetwork(
-                        observation_dim=self.network_config.get('observation_dim', 27),
+                        observation_dim=self.network_config.get('observation_dim', 56),
                         hidden_layers=self.network_config.get('hidden_layers', []),
-                        policy_hidden_size=self.network_config.get('policy_hidden_size', 16),
-                        value_hidden_size=self.network_config.get('value_hidden_size', 16),
-                        special_hidden_size=self.network_config.get('special_hidden_size', 16)
+                        policy_hidden_size=self.network_config.get('policy_hidden_size', 12),
+                        value_hidden_size=self.network_config.get('value_hidden_size', 12),
+                        special_hidden_size=self.network_config.get('special_hidden_size', 12)
                     ).to(f"cuda:{gpu_id}")
                     
                     self.pod_networks[pod_key] = network
@@ -137,11 +137,11 @@ class PPOTrainer:
             for i in range(2):
                 pod_key = f"player0_pod{i}"
                 network = PodNetwork(
-                    observation_dim=network_config.get('observation_dim', 27),
+                    observation_dim=network_config.get('observation_dim', 56),
                     hidden_layers=network_config.get('hidden_layers', []),
-                    policy_hidden_size=network_config.get('policy_hidden_size', 16),
-                    value_hidden_size=network_config.get('value_hidden_size', 16),
-                    special_hidden_size=network_config.get('special_hidden_size', 16)
+                    policy_hidden_size=network_config.get('policy_hidden_size', 12),
+                    value_hidden_size=network_config.get('value_hidden_size', 12),
+                    special_hidden_size=network_config.get('special_hidden_size', 12)
                 ).to(device)
                 
                 # Wrap with DataParallel if using multiple GPUs
@@ -159,11 +159,11 @@ class PPOTrainer:
             for i in range(2):
                 pod_key = f"player1_pod{i}"
                 network = PodNetwork(
-                    observation_dim=network_config.get('observation_dim', 27),
+                    observation_dim=network_config.get('observation_dim', 56),
                     hidden_layers=network_config.get('hidden_layers', []),
-                    policy_hidden_size=network_config.get('policy_hidden_size', 16),
-                    value_hidden_size=network_config.get('value_hidden_size', 16),
-                    special_hidden_size=network_config.get('special_hidden_size', 16)
+                    policy_hidden_size=network_config.get('policy_hidden_size', 12),
+                    value_hidden_size=network_config.get('value_hidden_size', 12),
+                    special_hidden_size=network_config.get('special_hidden_size', 12)
                 ).to(device)
                 
                 # Wrap with DataParallel if using multiple GPUs
@@ -647,33 +647,58 @@ class PPOTrainer:
             # Update policy
             policy_loss, value_loss = self.update_policy()
 
-            # Calculate average reward
-            avg_reward = 0
+            # Calculate role-specific average rewards
+            runner_reward = 0
+            blocker_reward = 0
+            runner_count = 0
+            blocker_count = 0
+            
             for pod_key in self.pod_networks.keys():
                 if 'rewards' in self.storage[pod_key]:
                     rewards = torch.cat([r for r in self.storage[pod_key]['rewards']])
-                    avg_reward += rewards.mean().item()
+                    avg_pod_reward = rewards.mean().item()
+                    
+                    # Determine if this is a runner or blocker
+                    if 'pod0' in pod_key:  # Runner
+                        runner_reward += avg_pod_reward
+                        runner_count += 1
+                    elif 'pod1' in pod_key:  # Blocker
+                        blocker_reward += avg_pod_reward
+                        blocker_count += 1
             
-            avg_reward /= len(self.pod_networks)
+            # Calculate averages
+            avg_runner_reward = runner_reward / max(1, runner_count)
+            avg_blocker_reward = blocker_reward / max(1, blocker_count)
+            avg_total_reward = (runner_reward + blocker_reward) / max(1, runner_count + blocker_count)
             
             # Reset storage for next iteration
             self.reset_storage()
             
-            # Log progress
+            # Log progress with role-specific information
             elapsed_time = time.time() - start_time
-            print(f"Iteration {iteration}/{num_iterations} completed in {elapsed_time:.2f}s, average reward: {avg_reward:.2f}, policy loss: {policy_loss:.4f}, value loss: {value_loss:.4f}")
+            print(f"Iteration {iteration}/{num_iterations} completed in {elapsed_time:.2f}s")
+            print(f"  Total reward: {avg_total_reward:.4f}")
+            print(f"  Runner reward: {avg_runner_reward:.4f}")
+            print(f"  Blocker reward: {avg_blocker_reward:.4f}")
+            print(f"  Policy loss: {policy_loss:.4f}, Value loss: {value_loss:.4f}")
 
-            # Log metrics to file
+            # Log metrics to file with role breakdown
             with open(log_file, 'a') as f:
-                f.write(f"iteration={iteration},reward={avg_reward:.4f},policy_loss={policy_loss:.4f},value_loss={value_loss:.4f},time={elapsed_time:.2f}\n")
+                f.write(f"iteration={iteration},total_reward={avg_total_reward:.4f},"
+                    f"runner_reward={avg_runner_reward:.4f},blocker_reward={avg_blocker_reward:.4f},"
+                    f"policy_loss={policy_loss:.4f},value_loss={value_loss:.4f},time={elapsed_time:.2f}\n")
             
-            # Send metrics to visualization panel
-            metrics = {
-                'reward': avg_reward,
-                'policy_loss': policy_loss,
-                'value_loss': value_loss
-            }
-            self.send_metrics_to_visualization(iteration, metrics, visualization_panel)         
+            # Send enhanced metrics to visualization panel
+            if visualization_panel is not None:
+                metrics = {
+                    'iteration': iteration,
+                    'total_reward': avg_total_reward,
+                    'runner_reward': avg_runner_reward,
+                    'blocker_reward': avg_blocker_reward,
+                    'policy_loss': policy_loss,
+                    'value_loss': value_loss
+                }
+                self.send_metrics_to_visualization(iteration, metrics, visualization_panel)       
 
             # Save models periodically
             if iteration % save_interval == 0:
