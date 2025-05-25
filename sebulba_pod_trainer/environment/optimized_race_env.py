@@ -182,164 +182,243 @@ class OptimizedRaceEnvironment:
         return self._get_observations()
     
     def _get_observations(self) -> Dict[str, torch.Tensor]:
-        """Get observations for all pods - updated with absolute angles"""
+        """Get observations with role-specific information"""
         observations = {}
         
-        # Pre-compute next checkpoint indices for all pods (with modulo based on batch-specific counts)
-        next_cp_indices = []
-        next_next_cp_indices = []
-        
-        for pod in self.pods:
-            next_cp_idx = torch.zeros_like(pod.current_checkpoint)
-            next_next_cp_idx = torch.zeros_like(pod.current_checkpoint)
-            
-            for b in range(self.batch_size):
-                num_cp = self.batch_checkpoint_counts[b].item()
-                next_cp_idx[b] = pod.current_checkpoint[b] % num_cp
-                next_next_cp_idx[b] = (pod.current_checkpoint[b] + 1) % num_cp
-            
-            next_cp_indices.append(next_cp_idx)
-            next_next_cp_indices.append(next_next_cp_idx)
-        
-        # Pre-compute next checkpoint positions for all pods
-        next_cp_positions = []
-        next_next_cp_positions = []
-        
-        for pod_idx in range(4):
-            # Get next checkpoint positions (vectorized)
-            next_cp_idx = next_cp_indices[pod_idx]
-            next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
-            for b in range(self.batch_size):
-                next_cp_pos[b] = self.checkpoints[b, next_cp_idx[b].item()]
-            next_cp_positions.append(next_cp_pos)
-            
-            # Get next-next checkpoint positions (vectorized)
-            next_next_cp_idx = next_next_cp_indices[pod_idx]
-            next_next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
-            for b in range(self.batch_size):
-                next_next_cp_pos[b] = self.checkpoints[b, next_next_cp_idx[b].item()]
-            next_next_cp_positions.append(next_next_cp_pos)
-        
         for pod_idx, pod in enumerate(self.pods):
-            # Get pod-specific observations
             player_idx = pod_idx // 2
             team_pod_idx = pod_idx % 2
             obs_key = f"player{player_idx}_pod{team_pod_idx}"
             
-            # Reuse cached tensors for normalization
-            # Normalize positions (in-place operations)
-            self.normalized_position_cache.copy_(pod.position)
-            self.normalized_position_cache[:, 0].mul_(2.0/WIDTH).sub_(1.0)  # Scale to [-1, 1]
-            self.normalized_position_cache[:, 1].mul_(2.0/HEIGHT).sub_(1.0)  # Scale to [-1, 1]
+            # Base observations (current 48 dims)
+            base_obs = self._get_base_observations(pod_idx, pod)
             
-            # Normalize velocities (in-place operations)
-            self.normalized_velocity_cache.copy_(pod.velocity)
-            self.normalized_velocity_cache.div_(1000.0)  # Typical max speed is around 600-800
+            # Role-specific observations (8 additional dims)
+            role_obs = self._get_role_observations(pod_idx, team_pod_idx)
             
-            # Normalize checkpoint positions (in-place operations)
-            self.normalized_next_cp_cache.copy_(next_cp_positions[pod_idx])
-            self.normalized_next_cp_cache[:, 0].mul_(2.0/WIDTH).sub_(1.0)
-            self.normalized_next_cp_cache[:, 1].mul_(2.0/HEIGHT).sub_(1.0)
-            
-            self.normalized_next_next_cp_cache.copy_(next_next_cp_positions[pod_idx])
-            self.normalized_next_next_cp_cache[:, 0].mul_(2.0/WIDTH).sub_(1.0)
-            self.normalized_next_next_cp_cache[:, 1].mul_(2.0/HEIGHT).sub_(1.0)
-            
-            # Calculate relative positions to next checkpoint (in-place operations)
-            self.rel_next_cp_cache.copy_(self.normalized_next_cp_cache)
-            self.rel_next_cp_cache.sub_(self.normalized_position_cache)
-            
-            self.rel_next_next_cp_cache.copy_(self.normalized_next_next_cp_cache)
-            self.rel_next_next_cp_cache.sub_(self.normalized_position_cache)
-
-            # Pod's absolute angle as sin/cos
-            pod_angle_rad = torch.deg2rad(pod.angle)
-            pod_angle_sin = torch.sin(pod_angle_rad)
-            pod_angle_cos = torch.cos(pod_angle_rad)
-
-            # Angle to next checkpoint as sin/cos
-            angle_to_next_cp = pod.angle_to(next_cp_positions[pod_idx])
-            angle_to_next_cp_rad = torch.deg2rad(angle_to_next_cp)
-            angle_to_next_cp_sin = torch.sin(angle_to_next_cp_rad)
-            angle_to_next_cp_cos = torch.cos(angle_to_next_cp_rad)
-
-            # Relative angle (how much to turn)
-            relative_angle = angle_to_next_cp - pod.angle
-            relative_angle = ((relative_angle + 180) % 360) - 180
-            relative_angle_normalized = relative_angle / 180.0
-
-            # Speed and direction metrics
-            speed_magnitude = torch.norm(pod.velocity, dim=1, keepdim=True) / 800.0
-            distance_to_next_cp = torch.norm(next_cp_positions[pod_idx] - pod.position, dim=1, keepdim=True)
-            distance_normalized = distance_to_next_cp / 600.0  # Normalize by checkpoint radius
-            
-            batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
-            progress = pod.current_checkpoint.float() / batch_total_checkpoints.float().unsqueeze(1)
-
-            # Pod-specific observations (18 dimensions)
-            pod_specific_obs = torch.cat([
-                self.normalized_position_cache,             # Pod position (2)
-                self.normalized_velocity_cache,             # Pod velocity (2)  
-                self.rel_next_cp_cache,                     # Relative position to next checkpoint (2)
-                self.rel_next_next_cp_cache,                # Relative position to next-next checkpoint (2)
-                pod_angle_sin, pod_angle_cos,               # Pod angle (sin/cos) (2)
-                angle_to_next_cp_sin, angle_to_next_cp_cos, # Angle to target (sin/cos) (2)
-                relative_angle_normalized,                  # How much to turn (1)
-                speed_magnitude,                            # Current speed (1)
-                distance_normalized,                        # Distance to next checkpoint (1)
-                progress,                                   # Progress (1)
-                pod.shield_cooldown / 3.0,                  # Shield cooldown (1)
-                pod.boost_available.float()                 # Boost availability (1)
-            ], dim=1)
-
-            # Add opponent information
-            opponent_obs_list = []
-            for opp_idx in range(4):
-                if opp_idx != pod_idx:  # Skip self
-                    opp_pod = self.pods[opp_idx]
-                    
-                    # Relative position and velocity of opponent
-                    rel_pos = (opp_pod.position - pod.position)
-                    normalized_rel_pos = rel_pos.clone()
-                    normalized_rel_pos[:, 0].mul_(2.0/WIDTH)
-                    normalized_rel_pos[:, 1].mul_(2.0/HEIGHT)
-                    
-                    rel_vel = opp_pod.velocity - pod.velocity
-                    normalized_rel_vel = rel_vel / 1000.0
-                    
-                    # Distance to opponent (normalized)
-                    distance = torch.norm(rel_pos, dim=1, keepdim=True) / (WIDTH/2)
-                    
-                    # Opponent's absolute angle
-                    opp_normalized_angle = (opp_pod.angle % 360) / 180.0 - 1.0
-                    
-                    # Opponent's progress
-                    batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
-                    opp_progress = opp_pod.current_checkpoint.float() / batch_total_checkpoints.float().unsqueeze(1)
-                    
-                    # Opponent's next checkpoint
-                    opp_next_cp_normalized = (opp_pod.current_checkpoint % self.num_checkpoints).float() / self.num_checkpoints
-                    
-                    # Add to list for single concatenation (10 dimensions per opponent)
-                    opponent_obs_list.append(torch.cat([
-                        normalized_rel_pos,                    # (2)
-                        normalized_rel_vel,                    # (2)
-                        distance,                             # (1)
-                        opp_normalized_angle,                 # (1)
-                        opp_progress,                         # (1)
-                        opp_next_cp_normalized,               # (1)
-                        opp_pod.shield_cooldown / 3.0,       # (1)
-                        opp_pod.boost_available.float()       # (1)
-                    ], dim=1))
-                            
-            # Combine pod-specific and opponent observations
-            # Pod-specific: 18 dimensions
-            # Opponent data: 3 opponents × 10 dimensions = 30 dimensions
-            # Total: 18 + 30 = 48 dimensions
-            all_opponent_obs = torch.cat(opponent_obs_list, dim=1)
-            observations[obs_key] = torch.cat([pod_specific_obs, all_opponent_obs], dim=1)
+            # Combine to 56 dimensions total
+            observations[obs_key] = torch.cat([base_obs, role_obs], dim=1)
         
         return observations
+
+    def _get_role_observations(self, pod_idx, team_pod_idx):
+        """Get role-specific observations"""
+        role_obs = torch.zeros(self.batch_size, 8, device=self.device)
+        
+        # Role identifier
+        role_obs[:, 0] = float(team_pod_idx)  # 0 for runner, 1 for blocker
+        
+        if team_pod_idx == 1:  # Blocker-specific observations
+            player_idx = pod_idx // 2
+            runner_idx = player_idx * 2
+            opponent_player_idx = 1 - player_idx
+            
+            runner = self.pods[runner_idx]
+            blocker = self.pods[pod_idx]
+            
+            # Distance to teammate runner (normalized)
+            runner_distance = torch.norm(blocker.position - runner.position, dim=1, keepdim=True)
+            role_obs[:, 1:2] = runner_distance / 8000.0
+            
+            # Runner's progress relative to blocker
+            progress_diff = (runner.current_checkpoint - blocker.current_checkpoint).float()
+            role_obs[:, 2:3] = torch.clamp(progress_diff / 5.0, -1.0, 1.0)
+            
+            # Closest opponent distance and relative position
+            min_opp_distance = float('inf')
+            closest_opp_pos = torch.zeros(self.batch_size, 2, device=self.device)
+            
+            for opp_idx in range(2):
+                opp_pod = self.pods[opponent_player_idx * 2 + opp_idx]
+                opp_distance = torch.norm(blocker.position - opp_pod.position, dim=1)
+                
+                closer_mask = opp_distance < min_opp_distance
+                if closer_mask.any():
+                    min_opp_distance = torch.where(closer_mask, opp_distance, min_opp_distance)
+                    closest_opp_pos[closer_mask] = opp_pod.position[closer_mask]
+            
+            # Normalized distance to closest opponent
+            role_obs[:, 3:4] = min_opp_distance.unsqueeze(1) / 8000.0
+            
+            # Relative position to closest opponent (normalized)
+            rel_opp_pos = (closest_opp_pos - blocker.position) / 8000.0
+            role_obs[:, 4:6] = rel_opp_pos
+            
+            # Blocking opportunity score (how well positioned to block)
+            role_obs[:, 6:7] = self._calculate_blocking_opportunity(pod_idx)
+            
+        # Remaining dimension for future use
+        role_obs[:, 7] = 0.0
+        
+        return role_obs
+
+    def _calculate_blocking_opportunity(self, blocker_idx):
+        """Calculate how well positioned the blocker is to interfere with opponents"""
+        blocker = self.pods[blocker_idx]
+        player_idx = blocker_idx // 2
+        opponent_player_idx = 1 - player_idx
+        
+        opportunity_score = torch.zeros(self.batch_size, 1, device=self.device)
+        
+        for opp_idx in range(2):
+            opp_pod = self.pods[opponent_player_idx * 2 + opp_idx]
+            
+            # Get opponent's next checkpoint
+            opp_next_cp_idx = opp_pod.current_checkpoint % self.num_checkpoints
+            opp_next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
+            for b in range(self.batch_size):
+                opp_next_cp_pos[b] = self.checkpoints[b, opp_next_cp_idx[b].item()]
+            
+            # Calculate if blocker can intercept opponent's path
+            opp_to_cp = opp_next_cp_pos - opp_pod.position
+            blocker_to_cp = opp_next_cp_pos - blocker.position
+            
+            # Simple interception opportunity based on relative distances
+            opp_distance_to_cp = torch.norm(opp_to_cp, dim=1, keepdim=True)
+            blocker_distance_to_cp = torch.norm(blocker_to_cp, dim=1, keepdim=True)
+            
+            # Higher score if blocker is closer to opponent's checkpoint
+            intercept_score = torch.clamp(1.0 - blocker_distance_to_cp / (opp_distance_to_cp + 1e-6), 0.0, 1.0)
+            opportunity_score += intercept_score
+        
+        return torch.clamp(opportunity_score / 2.0, 0.0, 1.0)  # Average and normalize
+   
+    def _get_base_observations(self, pod_idx, pod) -> torch.Tensor:
+        """Get base observations for a specific pod - updated with absolute angles"""
+        
+        # Pre-compute next checkpoint indices for this pod (with modulo based on batch-specific counts)
+        next_cp_idx = torch.zeros_like(pod.current_checkpoint)
+        next_next_cp_idx = torch.zeros_like(pod.current_checkpoint)
+        
+        for b in range(self.batch_size):
+            num_cp = self.batch_checkpoint_counts[b].item()
+            next_cp_idx[b] = pod.current_checkpoint[b] % num_cp
+            next_next_cp_idx[b] = (pod.current_checkpoint[b] + 1) % num_cp
+        
+        # Get next checkpoint positions (vectorized)
+        next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
+        for b in range(self.batch_size):
+            next_cp_pos[b] = self.checkpoints[b, next_cp_idx[b].item()]
+        
+        # Get next-next checkpoint positions (vectorized)
+        next_next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
+        for b in range(self.batch_size):
+            next_next_cp_pos[b] = self.checkpoints[b, next_next_cp_idx[b].item()]
+        
+        # Reuse cached tensors for normalization
+        # Normalize positions (in-place operations)
+        self.normalized_position_cache.copy_(pod.position)
+        self.normalized_position_cache[:, 0].mul_(2.0/WIDTH).sub_(1.0)  # Scale to [-1, 1]
+        self.normalized_position_cache[:, 1].mul_(2.0/HEIGHT).sub_(1.0)  # Scale to [-1, 1]
+        
+        # Normalize velocities (in-place operations)
+        self.normalized_velocity_cache.copy_(pod.velocity)
+        self.normalized_velocity_cache.div_(1000.0)  # Typical max speed is around 600-800
+        
+        # Normalize checkpoint positions (in-place operations)
+        self.normalized_next_cp_cache.copy_(next_cp_pos)
+        self.normalized_next_cp_cache[:, 0].mul_(2.0/WIDTH).sub_(1.0)
+        self.normalized_next_cp_cache[:, 1].mul_(2.0/HEIGHT).sub_(1.0)
+        
+        self.normalized_next_next_cp_cache.copy_(next_next_cp_pos)
+        self.normalized_next_next_cp_cache[:, 0].mul_(2.0/WIDTH).sub_(1.0)
+        self.normalized_next_next_cp_cache[:, 1].mul_(2.0/HEIGHT).sub_(1.0)
+        
+        # Calculate relative positions to next checkpoint (in-place operations)
+        self.rel_next_cp_cache.copy_(self.normalized_next_cp_cache)
+        self.rel_next_cp_cache.sub_(self.normalized_position_cache)
+        
+        self.rel_next_next_cp_cache.copy_(self.normalized_next_next_cp_cache)
+        self.rel_next_next_cp_cache.sub_(self.normalized_position_cache)
+
+        # Pod's absolute angle as sin/cos
+        pod_angle_rad = torch.deg2rad(pod.angle)
+        pod_angle_sin = torch.sin(pod_angle_rad)
+        pod_angle_cos = torch.cos(pod_angle_rad)
+
+        # Angle to next checkpoint as sin/cos
+        angle_to_next_cp = pod.angle_to(next_cp_pos)
+        angle_to_next_cp_rad = torch.deg2rad(angle_to_next_cp)
+        angle_to_next_cp_sin = torch.sin(angle_to_next_cp_rad)
+        angle_to_next_cp_cos = torch.cos(angle_to_next_cp_rad)
+
+        # Relative angle (how much to turn)
+        relative_angle = angle_to_next_cp - pod.angle
+        relative_angle = ((relative_angle + 180) % 360) - 180
+        relative_angle_normalized = relative_angle / 180.0
+
+        # Speed and direction metrics
+        speed_magnitude = torch.norm(pod.velocity, dim=1, keepdim=True) / 800.0
+        distance_to_next_cp = torch.norm(next_cp_pos - pod.position, dim=1, keepdim=True)
+        distance_normalized = distance_to_next_cp / 600.0  # Normalize by checkpoint radius
+        
+        batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
+        progress = pod.current_checkpoint.float() / batch_total_checkpoints.float().unsqueeze(1)
+
+        # Pod-specific observations (18 dimensions)
+        pod_specific_obs = torch.cat([
+            self.normalized_position_cache,             # Pod position (2)
+            self.normalized_velocity_cache,             # Pod velocity (2)  
+            self.rel_next_cp_cache,                     # Relative position to next checkpoint (2)
+            self.rel_next_next_cp_cache,                # Relative position to next-next checkpoint (2)
+            pod_angle_sin, pod_angle_cos,               # Pod angle (sin/cos) (2)
+            angle_to_next_cp_sin, angle_to_next_cp_cos, # Angle to target (sin/cos) (2)
+            relative_angle_normalized,                  # How much to turn (1)
+            speed_magnitude,                            # Current speed (1)
+            distance_normalized,                        # Distance to next checkpoint (1)
+            progress,                                   # Progress (1)
+            pod.shield_cooldown / 3.0,                  # Shield cooldown (1)
+            pod.boost_available.float()                 # Boost availability (1)
+        ], dim=1)
+
+        # Add opponent information
+        opponent_obs_list = []
+        for opp_idx in range(4):
+            if opp_idx != pod_idx:  # Skip self
+                opp_pod = self.pods[opp_idx]
+                
+                # Relative position and velocity of opponent
+                rel_pos = (opp_pod.position - pod.position)
+                normalized_rel_pos = rel_pos.clone()
+                normalized_rel_pos[:, 0].mul_(2.0/WIDTH)
+                normalized_rel_pos[:, 1].mul_(2.0/HEIGHT)
+                
+                rel_vel = opp_pod.velocity - pod.velocity
+                normalized_rel_vel = rel_vel / 1000.0
+                
+                # Distance to opponent (normalized)
+                distance = torch.norm(rel_pos, dim=1, keepdim=True) / (WIDTH/2)
+                
+                # Opponent's absolute angle
+                opp_normalized_angle = (opp_pod.angle % 360) / 180.0 - 1.0
+                
+                # Opponent's progress
+                batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
+                opp_progress = opp_pod.current_checkpoint.float() / batch_total_checkpoints.float().unsqueeze(1)
+                
+                # Opponent's next checkpoint
+                opp_next_cp_normalized = (opp_pod.current_checkpoint % self.num_checkpoints).float() / self.num_checkpoints
+                
+                # Add to list for single concatenation (10 dimensions per opponent)
+                opponent_obs_list.append(torch.cat([
+                    normalized_rel_pos,                    # (2)
+                    normalized_rel_vel,                    # (2)
+                    distance,                             # (1)
+                    opp_normalized_angle,                 # (1)
+                    opp_progress,                         # (1)
+                    opp_next_cp_normalized,               # (1)
+                    opp_pod.shield_cooldown / 3.0,       # (1)
+                    opp_pod.boost_available.float()       # (1)
+                ], dim=1))
+                        
+        # Combine pod-specific and opponent observations
+        # Pod-specific: 18 dimensions
+        # Opponent data: 3 opponents × 10 dimensions = 30 dimensions
+        # Total: 18 + 30 = 48 dimensions
+        all_opponent_obs = torch.cat(opponent_obs_list, dim=1)
+        base_observations = torch.cat([pod_specific_obs, all_opponent_obs], dim=1)
+        
+        return base_observations
     
     def step(self, actions: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """
@@ -558,72 +637,121 @@ class OptimizedRaceEnvironment:
         self.done = new_done
     
     def _calculate_rewards(self) -> Dict[str, torch.Tensor]:
-        """Calculate rewards for each pod - optimized version"""
+        """Calculate role-specific rewards for each pod"""
         rewards = {}
         
-        # Pre-compute next checkpoint positions for all pods
-        next_cp_positions = []
-        for pod in self.pods:
-            next_cp_idx = pod.current_checkpoint % self.num_checkpoints
-            next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
-            for b in range(self.batch_size):
-                next_cp_pos[b] = self.checkpoints[b, next_cp_idx[b].item()]
-            next_cp_positions.append(next_cp_pos)
-        
-        # Pre-compute race completion status for all pods
-        race_completed = [pod.current_checkpoint >= self.total_checkpoints for pod in self.pods]
+        # Pre-compute positions and states
+        next_cp_positions = self._get_next_checkpoint_positions()
         
         for pod_idx, pod in enumerate(self.pods):
             player_idx = pod_idx // 2
             team_pod_idx = pod_idx % 2
             pod_key = f"player{player_idx}_pod{team_pod_idx}"
             
-            # Base reward is progress through checkpoints
-            batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
-            self.checkpoint_reward_cache.copy_(pod.current_checkpoint.float() / batch_total_checkpoints.float().unsqueeze(1))
-            
-            # Distance-based reward (closer to next checkpoint is better)
-            diff = pod.position - next_cp_positions[pod_idx]
-            distances = torch.norm(diff, dim=1, keepdim=True)
-            self.distance_reward_cache.copy_(torch.clamp(1.0 - distances / 5000.0, 0.0, 1.0))
-            
-            # Velocity-based reward (higher speed towards checkpoint is better)
-            direction_to_checkpoint = next_cp_positions[pod_idx] - pod.position
-            direction_norm = torch.norm(direction_to_checkpoint, dim=1, keepdim=True)
-            direction_norm = torch.where(direction_norm > 0, direction_norm, torch.ones_like(direction_norm))
-            normalized_direction = direction_to_checkpoint / direction_norm
-            
-            velocity_alignment = torch.sum(normalized_direction * pod.velocity, dim=1, keepdim=True)
-            self.velocity_reward_cache.copy_(torch.clamp(velocity_alignment / 500.0, -1.0, 1.0))
-            
-            # Combine rewards
-            pod_reward = self.checkpoint_reward_cache + 0.01 * self.distance_reward_cache + 0.005 * self.velocity_reward_cache
-            
-            # Win/loss reward
-            pod_reward = torch.where(race_completed[pod_idx], pod_reward + 10.0, pod_reward)
-            
-            # Opponent pods (from other player)
-            opponent_player_idx = 1 - player_idx
-            opponent_pods = [
-                self.pods[opponent_player_idx*2], 
-                self.pods[opponent_player_idx*2+1]
-            ]
-            
-            # Penalty if opponent completes race
-            for opp_idx in range(2):
-                opp_pod_idx = opponent_player_idx * 2 + opp_idx
-                pod_reward = torch.where(race_completed[opp_pod_idx], pod_reward - 5.0, pod_reward)
-            
-            rewards[pod_key] = pod_reward
+            if team_pod_idx == 0:  # Runner pod
+                rewards[pod_key] = self._calculate_runner_reward(pod_idx, pod, next_cp_positions)
+            else:  # Blocker pod
+                rewards[pod_key] = self._calculate_blocker_reward(pod_idx, pod, next_cp_positions)
         
         return rewards
 
-    def get_checkpoints(self):
-        """Return checkpoint positions for visualization"""
-        if self.checkpoints is not None:
-            # Return first batch's checkpoints
-            return self.checkpoints[0].cpu().numpy().tolist()
-        return []
+    def _calculate_runner_reward(self, pod_idx, pod, next_cp_positions):
+        """Reward runner for racing performance"""
+        # Current racing rewards
+        checkpoint_reward = pod.current_checkpoint.float() / (self.batch_checkpoint_counts * self.laps).float().unsqueeze(1)
+        
+        # Distance to next checkpoint
+        diff = pod.position - next_cp_positions[pod_idx]
+        distances = torch.norm(diff, dim=1, keepdim=True)
+        distance_reward = torch.clamp(1.0 - distances / 5000.0, 0.0, 1.0)
+        
+        # Speed towards checkpoint
+        direction_to_checkpoint = next_cp_positions[pod_idx] - pod.position
+        direction_norm = torch.norm(direction_to_checkpoint, dim=1, keepdim=True)
+        direction_norm = torch.where(direction_norm > 0, direction_norm, torch.ones_like(direction_norm))
+        normalized_direction = direction_to_checkpoint / direction_norm
+        velocity_alignment = torch.sum(normalized_direction * pod.velocity, dim=1, keepdim=True)
+        velocity_reward = torch.clamp(velocity_alignment / 500.0, -1.0, 1.0)
+        
+        # Combine with higher weight on progress
+        return checkpoint_reward * 2.0 + 0.02 * distance_reward + 0.01 * velocity_reward
+
+    def _calculate_blocker_reward(self, pod_idx, pod, next_cp_positions):
+        """Reward blocker for blocking and supporting runner"""
+        player_idx = pod_idx // 2
+        opponent_player_idx = 1 - player_idx
+        runner_idx = player_idx * 2  # Teammate runner
+        
+        # Base progress reward (lower weight than runner)
+        checkpoint_reward = pod.current_checkpoint.float() / (self.batch_checkpoint_counts * self.laps).float().unsqueeze(1)
+        
+        # Blocking rewards
+        blocking_reward = self._calculate_blocking_reward(pod_idx, opponent_player_idx)
+        
+        # Support runner reward
+        support_reward = self._calculate_support_reward(pod_idx, runner_idx)
+        
+        # Combine rewards with emphasis on blocking
+        return 0.5 * checkpoint_reward + 1.0 * blocking_reward + 0.5 * support_reward
+
+    def _calculate_blocking_reward(self, blocker_idx, opponent_player_idx):
+        """Reward for blocking opponent pods"""
+        blocker = self.pods[blocker_idx]
+        opponent_pods = [self.pods[opponent_player_idx * 2], self.pods[opponent_player_idx * 2 + 1]]
+        
+        total_blocking_reward = torch.zeros(self.batch_size, 1, device=self.device)
+        
+        for opp_pod in opponent_pods:
+            # Get opponent's next checkpoint
+            opp_next_cp_idx = opp_pod.current_checkpoint % self.num_checkpoints
+            opp_next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
+            for b in range(self.batch_size):
+                opp_next_cp_pos[b] = self.checkpoints[b, opp_next_cp_idx[b].item()]
+            
+            # Reward for being between opponent and their checkpoint
+            opp_to_cp = opp_next_cp_pos - opp_pod.position
+            opp_to_blocker = blocker.position - opp_pod.position
+            
+            # Calculate if blocker is in opponent's path
+            opp_to_cp_norm = torch.norm(opp_to_cp, dim=1, keepdim=True)
+            opp_to_cp_norm = torch.where(opp_to_cp_norm > 0, opp_to_cp_norm, torch.ones_like(opp_to_cp_norm))
+            opp_direction = opp_to_cp / opp_to_cp_norm
+            
+            # Project blocker position onto opponent's path
+            projection = torch.sum(opp_to_blocker * opp_direction, dim=1, keepdim=True)
+            
+            # Reward for being in front of opponent on their path
+            path_blocking = torch.clamp(projection / 1000.0, 0.0, 1.0)
+            
+            # Distance-based blocking reward
+            blocker_to_opp = torch.norm(blocker.position - opp_pod.position, dim=1, keepdim=True)
+            proximity_reward = torch.clamp(1.0 - blocker_to_opp / 2000.0, 0.0, 1.0)
+            
+            total_blocking_reward += 0.7 * path_blocking + 0.3 * proximity_reward
+        
+        return total_blocking_reward
+
+    def _calculate_support_reward(self, blocker_idx, runner_idx):
+        """Reward blocker for supporting runner"""
+        blocker = self.pods[blocker_idx]
+        runner = self.pods[runner_idx]
+        
+        # Reward for not being too far from runner (coordination)
+        distance_to_runner = torch.norm(blocker.position - runner.position, dim=1, keepdim=True)
+        coordination_reward = torch.clamp(1.0 - distance_to_runner / 8000.0, 0.0, 1.0)
+        
+        # Small penalty if blocker is ahead of runner (runner should lead)
+        progress_diff = runner.current_checkpoint - blocker.current_checkpoint
+        leadership_reward = torch.clamp(progress_diff.float() * 0.1, -0.5, 0.5)
+        
+        return 0.3 * coordination_reward + 0.2 * leadership_reward
+
+        def get_checkpoints(self):
+            """Return checkpoint positions for visualization"""
+            if self.checkpoints is not None:
+                # Return first batch's checkpoints
+                return self.checkpoints[0].cpu().numpy().tolist()
+            return []
     
     def get_pod_states(self):
         """Get current pod states for visualization"""

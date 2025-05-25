@@ -9,7 +9,7 @@ class PodNetwork(nn.Module):
     Takes observations as input and outputs actions.
     """
     def __init__(self, 
-                 observation_dim: int = 47,  # Updated for new observation format
+                 observation_dim: int = 56,  # Updated for new observation format
                  hidden_layers: List[Dict[str, Any]] = None,
                  policy_hidden_size: int = 12,  # Reduced from 16
                  value_hidden_size: int = 12,   # Reduced from 16

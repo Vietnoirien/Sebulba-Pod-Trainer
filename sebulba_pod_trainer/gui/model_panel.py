@@ -29,7 +29,7 @@ class ModelPanel(wx.Panel):
         # Input dimension
         input_sizer = wx.BoxSizer(wx.HORIZONTAL)
         input_label = wx.StaticText(self, label="Observation Dimension:")
-        self.input_dim_ctrl = wx.SpinCtrl(self, min=1, max=100, initial=48)  # Updated for new observation format
+        self.input_dim_ctrl = wx.SpinCtrl(self, min=1, max=100, initial=56)  # Updated for new observation format
         input_sizer.Add(input_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
         input_sizer.Add(self.input_dim_ctrl, 0, wx.EXPAND)
         arch_sizer.Add(input_sizer, 0, wx.EXPAND | wx.ALL, 5)
@@ -164,7 +164,7 @@ class ModelPanel(wx.Panel):
         network_config = self.config.get('network_config', {})
         
         # Update observation dimension
-        self.input_dim_ctrl.SetValue(network_config.get('observation_dim', 48))
+        self.input_dim_ctrl.SetValue(network_config.get('observation_dim', 56))
         
         # Update hidden layers
         hidden_layers = network_config.get('hidden_layers', [
@@ -488,7 +488,7 @@ class VisualizationPanel(wx.Panel):
         if not self.network_config:
             return 0
             
-        observation_dim = self.network_config.get('observation_dim', 48)
+        observation_dim = self.network_config.get('observation_dim', 56)
         hidden_layers = self.network_config.get('hidden_layers', [])
         policy_hidden_size = self.network_config.get('policy_hidden_size', 12)
         value_hidden_size = self.network_config.get('value_hidden_size', 12)
@@ -587,7 +587,7 @@ class VisualizationPanel(wx.Panel):
         from ..models.neural_pod import PodNetwork
         
         network = PodNetwork(
-            observation_dim=network_config.get('observation_dim', 41),
+            observation_dim=network_config.get('observation_dim', 56),
             hidden_layers=network_config.get('hidden_layers', []),
             policy_hidden_size=network_config.get('policy_hidden_size', 12),
             value_hidden_size=network_config.get('value_hidden_size', 12),
