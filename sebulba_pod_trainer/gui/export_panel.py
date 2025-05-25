@@ -26,7 +26,7 @@ class ExportPanel(wx.Panel):
         
         model_sizer.Add(dir_sizer, 0, wx.EXPAND | wx.ALL, 5)
         
-        # Model selection strategy (similar to visualization panel)
+        # Model selection strategy
         strategy_sizer = wx.BoxSizer(wx.HORIZONTAL)
         strategy_label = wx.StaticText(self, label="Model Selection:")
         self.model_selection_choice = wx.Choice(self, choices=["Best Performance", "Latest Iteration", "Manual Select"])
@@ -171,7 +171,7 @@ class ExportPanel(wx.Panel):
             self.update_preview()
     
     def populate_manual_model_lists(self):
-        """Populate the manual model selection dropdowns"""
+        """Populate the manual model selection dropdowns with role-based naming"""
         model_dir = self.model_dir_text.GetValue()
         if not model_dir:
             return
@@ -184,28 +184,50 @@ class ExportPanel(wx.Panel):
         self.manual_runner_choice.Clear()
         self.manual_blocker_choice.Clear()
         
-        # Find all model files for each pod
-        for pod_name in ["player0_pod0", "player0_pod1"]:
+        # Find all model files for each role
+        for role in ["runner", "blocker"]:
             model_files = []
             
-            # Standard files
-            standard_file = model_path / f"{pod_name}.pt"
-            if standard_file.exists():
-                model_files.append(f"Standard: {pod_name}.pt")
+            # Look for role-based files (new naming convention)
+            # Pattern: player{X}_{role}_gpu{Y}.pt or player{X}_{role}_gpu{Y}_iter{Z}.pt
+            role_files = list(model_path.glob(f"player*_{role}*.pt"))
             
-            # GPU-specific files
-            gpu_files = list(model_path.glob(f"{pod_name}_gpu*.pt"))
-            for gpu_file in sorted(gpu_files):
-                model_files.append(f"GPU: {gpu_file.name}")
+            # Also look for legacy pod-based files if no role-based files found
+            if not role_files:
+                if role == "runner":
+                    role_files = list(model_path.glob("player*_pod0*.pt"))
+                elif role == "blocker":
+                    role_files = list(model_path.glob("player*_pod1*.pt"))
             
-            # Iteration files
-            iter_files = list(model_path.glob(f"{pod_name}_gpu*_iter*.pt"))
-            for iter_file in sorted(iter_files, key=lambda x: self.extract_iteration_number(x.name)):
-                iteration = self.extract_iteration_number(iter_file.name)
-                model_files.append(f"Iter {iteration}: {iter_file.name}")
+            # Categorize files
+            standard_files = []
+            gpu_files = []
+            iter_files = []
+            
+            for model_file in role_files:
+                filename = model_file.name
+                if '_iter' in filename:
+                    iteration = self.extract_iteration_number(filename)
+                    iter_files.append((iteration, filename))
+                elif '_gpu' in filename and '_iter' not in filename:
+                    gpu_files.append(filename)
+                else:
+                    standard_files.append(filename)
+            
+            # Add standard files
+            for filename in sorted(standard_files):
+                model_files.append(f"Standard: {filename}")
+            
+            # Add GPU files
+            for filename in sorted(gpu_files):
+                model_files.append(f"GPU: {filename}")
+            
+            # Add iteration files (sorted by iteration number)
+            for iteration, filename in sorted(iter_files, key=lambda x: x[0], reverse=True):
+                model_files.append(f"Iter {iteration}: {filename}")
             
             # Add to appropriate dropdown
-            choice_ctrl = self.manual_runner_choice if pod_name == "player0_pod0" else self.manual_blocker_choice
+            choice_ctrl = self.manual_runner_choice if role == "runner" else self.manual_blocker_choice
             for model_file in model_files:
                 choice_ctrl.Append(model_file)
             
@@ -221,23 +243,23 @@ class ExportPanel(wx.Panel):
             pass
         return 0
     
-    def find_best_model_file(self, pod_name, model_path):
-        """Find the best model file based on selection strategy (copied from visualization panel)"""
+    def find_best_model_file(self, role, model_path):
+        """Find the best model file based on selection strategy and role"""
         selection = self.model_selection_choice.GetSelection()
         strategy = self.model_selection_choice.GetString(selection)
         
         if strategy == "Manual Select":
-            return self.get_manual_selected_model(pod_name, model_path)
+            return self.get_manual_selected_model(role, model_path)
         elif strategy == "Latest Iteration":
-            return self.find_latest_model_file(pod_name, model_path)
+            return self.find_latest_model_file(role, model_path)
         else:  # Best Performance
-            return self.find_best_performance_model_file(pod_name, model_path)
+            return self.find_best_performance_model_file(role, model_path)
     
-    def get_manual_selected_model(self, pod_name, model_path):
+    def get_manual_selected_model(self, role, model_path):
         """Get manually selected model file"""
-        if pod_name == "player0_pod0":
+        if role == "runner":
             choice_ctrl = self.manual_runner_choice
-        elif pod_name == "player0_pod1":
+        elif role == "blocker":
             choice_ctrl = self.manual_blocker_choice
         else:
             return None
@@ -257,21 +279,34 @@ class ExportPanel(wx.Panel):
                 return model_file
         
         # Fallback to best performance if manual selection doesn't work
-        return self.find_best_performance_model_file(pod_name, model_path)
+        return self.find_best_performance_model_file(role, model_path)
     
-    def find_latest_model_file(self, pod_name, model_path):
-        """Find the latest model file by iteration number"""
-        # First try standard filename
-        standard_file = model_path / f"{pod_name}.pt"
-        if standard_file.exists():
-            return standard_file
+    def find_latest_model_file(self, role, model_path):
+        """Find the latest model file by iteration number for a specific role"""
+        # Look for role-based files first (new naming convention)
+        role_files = list(model_path.glob(f"player*_{role}*.pt"))
         
-        # Collect all iteration files for this pod
-        iter_files = list(model_path.glob(f"{pod_name}_gpu*_iter*.pt"))
+        # Fallback to legacy pod-based naming if no role-based files found
+        if not role_files:
+            if role == "runner":
+                role_files = list(model_path.glob("player*_pod0*.pt"))
+            elif role == "blocker":
+                role_files = list(model_path.glob("player*_pod1*.pt"))
+        
+        if not role_files:
+            return None
+        
+        # Look for standard file first (usually the latest)
+        standard_files = [f for f in role_files if '_gpu' not in f.name and '_iter' not in f.name]
+        if standard_files:
+            return standard_files[0]
+        
+        # Collect all iteration files for this role
+        iter_files = [f for f in role_files if '_iter' in f.name]
         
         if not iter_files:
             # Try GPU files without iteration
-            gpu_files = list(model_path.glob(f"{pod_name}_gpu*.pt"))
+            gpu_files = [f for f in role_files if '_gpu' in f.name and '_iter' not in f.name]
             return gpu_files[0] if gpu_files else None
         
         # Sort by iteration number and return the latest
@@ -289,29 +324,42 @@ class ExportPanel(wx.Panel):
         
         return None
     
-    def find_best_performance_model_file(self, pod_name, model_path):
-        """Find the best model file based on training performance"""
-        # First try standard filename (usually the final/best model)
-        standard_file = model_path / f"{pod_name}.pt"
-        if standard_file.exists():
-            return standard_file
+    def find_best_performance_model_file(self, role, model_path):
+        """Find the best model file based on training performance for a specific role"""
+        # Look for role-based files first (new naming convention)
+        role_files = list(model_path.glob(f"player*_{role}*.pt"))
         
-        # Collect all possible model files for this pod
+        # Fallback to legacy pod-based naming if no role-based files found
+        if not role_files:
+            if role == "runner":
+                role_files = list(model_path.glob("player*_pod0*.pt"))
+            elif role == "blocker":
+                role_files = list(model_path.glob("player*_pod1*.pt"))
+        
+        if not role_files:
+            return None
+        
+        # First try standard filename (usually the final/best model)
+        standard_files = [f for f in role_files if '_gpu' not in f.name and '_iter' not in f.name]
+        if standard_files:
+            return standard_files[0]
+        
+        # Collect all possible model files for this role
         all_model_files = []
         
         # GPU-specific files without iteration (usually latest/best)
-        gpu_files = list(model_path.glob(f"{pod_name}_gpu*.pt"))
+        gpu_files = [f for f in role_files if '_gpu' in f.name and '_iter' not in f.name]
         all_model_files.extend(gpu_files)
         
         # GPU-specific files with iteration
-        iter_files = list(model_path.glob(f"{pod_name}_gpu*_iter*.pt"))
+        iter_files = [f for f in role_files if '_iter' in f.name]
         all_model_files.extend(iter_files)
         
         if not all_model_files:
             return None
         
         # Try to find the best model based on training logs
-        best_model = self.find_best_model_from_logs(all_model_files, model_path)
+        best_model = self.find_best_model_from_logs(all_model_files, model_path, role)
         if best_model:
             return best_model
         
@@ -333,8 +381,8 @@ class ExportPanel(wx.Panel):
         # Final fallback: return the first file
         return all_model_files[0]
 
-    def find_best_model_from_logs(self, model_files, model_path):
-        """Find the best model based on training log performance"""
+    def find_best_model_from_logs(self, model_files, model_path, role):
+        """Find the best model based on training log performance for a specific role"""
         # Look for training log files
         log_files = []
         standard_log = model_path / "training_log.txt"
@@ -347,10 +395,13 @@ class ExportPanel(wx.Panel):
         if not log_files:
             return None
         
-        # Parse logs to find best performing iterations
+        # Parse logs to find best performing iterations for the specific role
         best_iteration = None
         best_reward = float('-inf')
         iteration_rewards = {}
+        
+        # Determine which reward column to use based on role
+        reward_column = "runner_reward" if role == "runner" else "blocker_reward"
         
         for log_file in log_files:
             try:
@@ -358,19 +409,30 @@ class ExportPanel(wx.Panel):
                     for line in f:
                         try:
                             parts = line.strip().split(',')
-                            if len(parts) >= 2:
+                            if len(parts) >= 4:  # Ensure we have enough columns
                                 iteration = int(parts[0].split('=')[1])
-                                reward = float(parts[1].split('=')[1])
                                 
-                                # Track the best reward and its iteration
-                                if reward > best_reward:
-                                    best_reward = reward
-                                    best_iteration = iteration
+                                # Look for role-specific reward
+                                role_reward = None
+                                for part in parts:
+                                    if reward_column in part:
+                                        role_reward = float(part.split('=')[1])
+                                        break
                                 
-                                # Store all iteration rewards for averaging
-                                if iteration not in iteration_rewards:
-                                    iteration_rewards[iteration] = []
-                                iteration_rewards[iteration].append(reward)
+                                # Fallback to total reward if role-specific not found
+                                if role_reward is None and len(parts) >= 2:
+                                    role_reward = float(parts[1].split('=')[1])
+                                
+                                if role_reward is not None:
+                                    # Track the best reward and its iteration
+                                    if role_reward > best_reward:
+                                        best_reward = role_reward
+                                        best_iteration = iteration
+                                    
+                                    # Store all iteration rewards for averaging
+                                    if iteration not in iteration_rewards:
+                                        iteration_rewards[iteration] = []
+                                    iteration_rewards[iteration].append(role_reward)
                                 
                         except (ValueError, IndexError):
                             continue
@@ -421,15 +483,17 @@ class ExportPanel(wx.Panel):
                 self.blocker_choice.Append(model_file.name)
             
             # Try to select appropriate defaults (legacy)
-            self.select_default_model(self.runner_choice, "pod0")
-            self.select_default_model(self.blocker_choice, "pod1")
+            self.select_default_model(self.runner_choice, "runner")
+            self.select_default_model(self.blocker_choice, "blocker")
             
             # Update manual model lists if in manual mode
             if self.model_selection_choice.GetSelection() == 2:  # Manual Select
                 self.populate_manual_model_lists()
             
             # Update status
-            self.status_text.SetLabel(f"Found {len(model_files)} model files in directory")
+            runner_files = len(list(model_path.glob("*runner*.pt"))) + len(list(model_path.glob("*pod0*.pt")))
+            blocker_files = len(list(model_path.glob("*blocker*.pt"))) + len(list(model_path.glob("*pod1*.pt")))
+            self.status_text.SetLabel(f"Found {runner_files} runner models and {blocker_files} blocker models")
             
             # Update preview
             self.update_preview()
@@ -437,12 +501,20 @@ class ExportPanel(wx.Panel):
         except Exception as e:
             self.status_text.SetLabel(f"Error loading models: {str(e)}")
     
-    def select_default_model(self, choice_ctrl, pod_name):
-        """Try to select a default model based on pod name (legacy function)"""
-        # Try to find a model with the pod name
+    def select_default_model(self, choice_ctrl, role):
+        """Try to select a default model based on role"""
+        # Try to find a model with the role name
         for i in range(choice_ctrl.GetCount()):
             item = choice_ctrl.GetString(i)
-            if pod_name in item:
+            if role in item:
+                choice_ctrl.SetSelection(i)
+                return
+        
+        # Fallback to legacy pod naming
+        legacy_name = "pod0" if role == "runner" else "pod1"
+        for i in range(choice_ctrl.GetCount()):
+            item = choice_ctrl.GetString(i)
+            if legacy_name in item:
                 choice_ctrl.SetSelection(i)
                 return
         
@@ -482,7 +554,7 @@ class ExportPanel(wx.Panel):
         self.precision_value.SetLabel(f"{precision} decimal places")
     
     def get_selected_model_info(self):
-        """Get information about the selected models"""
+        """Get information about the selected models using role-based naming"""
         model_dir = self.model_dir_text.GetValue()
         if not model_dir or not os.path.exists(model_dir):
             return None, None, "Please select a valid model directory first"
@@ -490,11 +562,11 @@ class ExportPanel(wx.Panel):
         model_path = Path(model_dir)
         
         # Get runner model
-        runner_model = self.find_best_model_file("player0_pod0", model_path)
+        runner_model = self.find_best_model_file("runner", model_path)
         runner_name = runner_model.name if runner_model else "Not found"
         
         # Get blocker model
-        blocker_model = self.find_best_model_file("player0_pod1", model_path)
+        blocker_model = self.find_best_model_file("blocker", model_path)
         blocker_name = blocker_model.name if blocker_model else "Not found"
         
         return runner_name, blocker_name, None
@@ -552,13 +624,13 @@ The exported model will include:
         
         # Verify that we can find the required models
         model_path = Path(model_dir)
-        runner_model = self.find_best_model_file("player0_pod0", model_path)
-        blocker_model = self.find_best_model_file("player0_pod1", model_path)
+        runner_model = self.find_best_model_file("runner", model_path)
+        blocker_model = self.find_best_model_file("blocker", model_path)
         
         if not runner_model or not blocker_model:
             wx.MessageBox(f"Could not find required model files:\n"
-                         f"Runner (pod0): {'Found' if runner_model else 'Not found'}\n"
-                         f"Blocker (pod1): {'Found' if blocker_model else 'Not found'}", 
+                         f"Runner: {'Found' if runner_model else 'Not found'}\n"
+                         f"Blocker: {'Found' if blocker_model else 'Not found'}", 
                          "Model Files Error", wx.OK | wx.ICON_ERROR)
             return
         
@@ -581,11 +653,12 @@ The exported model will include:
             # Create and run the exporter with specific model files
             exporter = ModelExporter(model_dir, output_path, network_config=network_config)
             
-            # Set specific model files if using advanced selection
+            # Set specific model files using role-based mapping
             if hasattr(exporter, 'set_model_files'):
+                # Map roles to the legacy pod naming that the exporter expects
                 exporter.set_model_files({
-                    'player0_pod0': runner_model,
-                    'player0_pod1': blocker_model
+                    'player0_pod0': runner_model,  # Runner maps to pod0
+                    'player0_pod1': blocker_model  # Blocker maps to pod1
                 })
             
             exporter.export(quantize=quantize, precision=precision)

@@ -25,11 +25,20 @@ class VisualizationPanel(wx.Panel):
         self.iterations = []
         
         # Queue for receiving metrics from training thread
-        self.metrics_queue = queue.Queue()
+        self.metrics_queue = queue.Queue(maxsize=1000)  # Limit queue size
         
         # Dictionary to store multiple race visualizations
         self.race_visualizations = {}
         self.active_worker_id = None
+
+        # Add throttling for visualization updates
+        self.last_race_update = {}
+        self.race_update_interval = 0.5  # Update race visualization every 500ms
+        self.last_plot_update = 0
+        self.plot_update_interval = 1.0  # Update plots every 1 second
+
+        # Add missing initialization for updating_visualization flag
+        self.updating_visualization = False
         
         # Create UI components
         self.create_ui()
@@ -40,7 +49,7 @@ class VisualizationPanel(wx.Panel):
         # Start update timer for real-time plotting
         self.update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_timer, self.update_timer)
-        self.update_timer.Start(1000)  # Update every second
+        self.update_timer.Start(500)  # Update every 500ms
     
     def create_ui(self):
         # Main sizer
@@ -222,6 +231,26 @@ class VisualizationPanel(wx.Panel):
             
             # Refresh layout
             self.Layout()
+
+    def on_browse(self, event):
+        """Handle browse button click to select model directory"""
+        with wx.DirDialog(self, "Choose model directory", 
+                        defaultPath=self.model_dir_ctrl.GetValue(),
+                        style=wx.DD_DEFAULT_STYLE | wx.DD_DIR_MUST_EXIST) as dialog:
+            
+            if dialog.ShowModal() == wx.ID_OK:
+                selected_path = dialog.GetPath()
+                self.model_dir_ctrl.SetValue(selected_path)
+                # Automatically load training data when directory is selected
+                self.load_training_data(selected_path)
+
+    def on_refresh(self, event):
+        """Handle refresh button click to reload training data"""
+        model_dir = self.model_dir_ctrl.GetValue()
+        if model_dir:
+            self.load_training_data(model_dir)
+        else:
+            wx.MessageBox("Please select a model directory first", "Refresh Error", wx.OK | wx.ICON_WARNING)
     
     def populate_manual_model_list(self):
         """Populate the manual model selection dropdown"""
@@ -239,30 +268,48 @@ class VisualizationPanel(wx.Panel):
         # Find all model files
         model_files = []
         
-        # Standard files
+        # New standard files (runner/blocker)
+        for role in ["runner", "blocker"]:
+            standard_file = model_path / f"player0_{role}.pt"
+            if standard_file.exists():
+                model_files.append(f"Standard: player0_{role}.pt")
+        
+        # Legacy standard files (pod0/pod1)
         for pod_name in ["player0_pod0", "player0_pod1"]:
             standard_file = model_path / f"{pod_name}.pt"
             if standard_file.exists():
-                model_files.append(f"Standard: {pod_name}.pt")
+                model_files.append(f"Legacy: {pod_name}.pt")
         
-        # GPU-specific files
+        # New GPU-specific files (runner/blocker)
+        for role in ["runner", "blocker"]:
+            gpu_files = list(model_path.glob(f"player0_{role}_gpu*.pt"))
+            for gpu_file in sorted(gpu_files):
+                model_files.append(f"GPU: {gpu_file.name}")
+        
+        # Legacy GPU-specific files (pod0/pod1)
         gpu_files = list(model_path.glob("player0_pod*_gpu*.pt"))
         for gpu_file in sorted(gpu_files):
-            model_files.append(f"GPU: {gpu_file.name}")
+            model_files.append(f"Legacy GPU: {gpu_file.name}")
         
-        # Iteration files
+        # New iteration files (runner/blocker)
+        for role in ["runner", "blocker"]:
+            iter_files = list(model_path.glob(f"player0_{role}_gpu*_iter*.pt"))
+            for iter_file in sorted(iter_files, key=lambda x: self.extract_iteration_number(x.name)):
+                iteration = self.extract_iteration_number(iter_file.name)
+                model_files.append(f"Iter {iteration}: {iter_file.name}")
+        
+        # Legacy iteration files (pod0/pod1)
         iter_files = list(model_path.glob("player0_pod*_gpu*_iter*.pt"))
         for iter_file in sorted(iter_files, key=lambda x: self.extract_iteration_number(x.name)):
             iteration = self.extract_iteration_number(iter_file.name)
-            model_files.append(f"Iter {iteration}: {iter_file.name}")
+            model_files.append(f"Legacy Iter {iteration}: {iter_file.name}")
         
         # Add to dropdown
         for model_file in model_files:
             self.manual_model_choice.Append(model_file)
         
         if model_files:
-            self.manual_model_choice.SetSelection(0)
-    
+            self.manual_model_choice.SetSelection(0)    
     def extract_iteration_number(self, filename):
         """Extract iteration number from filename"""
         try:
@@ -368,66 +415,167 @@ class VisualizationPanel(wx.Panel):
         self.race_figure.tight_layout()
     
     def update_plots(self):
-        """Update plots with current data"""
+        """Update plots with current data - optimized version"""
         if not self.iterations:
             return
         
-        # Update rewards plot
-        self.rewards_line.set_data(self.iterations, self.rewards)
-        self.rewards_ax.relim()
-        self.rewards_ax.autoscale_view()
-        self.rewards_canvas.draw()
-        
-        # Update losses plot
-        self.policy_line.set_data(self.iterations, self.policy_losses)
-        self.value_line.set_data(self.iterations, self.value_losses)
-        self.losses_ax.relim()
-        self.losses_ax.autoscale_view()
-        self.losses_canvas.draw()
+        try:
+            # Update rewards plot
+            self.rewards_line.set_data(self.iterations, self.rewards)
+            self.rewards_ax.relim()
+            self.rewards_ax.autoscale_view()
+            
+            # Update losses plot
+            self.policy_line.set_data(self.iterations, self.policy_losses)
+            self.value_line.set_data(self.iterations, self.value_losses)
+            self.losses_ax.relim()
+            self.losses_ax.autoscale_view()
+            
+            # Use draw_idle for better performance
+            self.rewards_canvas.draw_idle()
+            self.losses_canvas.draw_idle()
+            
+        except Exception as e:
+            print(f"Error updating plots: {e}")    
+    def _add_metric_data(self, iteration, reward, policy_loss, value_loss):
+        """Add metric data to the internal lists (thread-safe)"""
+        try:
+            # Ensure we're on the main thread
+            if not wx.IsMainThread():
+                wx.CallAfter(self._add_metric_data, iteration, reward, policy_loss, value_loss)
+                return
+            
+            self.iterations.append(iteration)
+            self.rewards.append(reward)
+            self.policy_losses.append(policy_loss)
+            self.value_losses.append(value_loss)
+            
+            # Update plots
+            self.update_plots()
+            
+        except Exception as e:
+            print(f"Error in _add_metric_data: {e}")
+            import traceback
+            traceback.print_exc()
     
     def on_timer(self, event):
-        """Process any new metrics data from the queue"""
-        if not self.live_check.GetValue():
+        """Process any new metrics data from the queue with throttling"""
+        if not self.live_check.GetValue() or self.updating_visualization:
+            return
+        
+        current_time = time.time()
+        
+        # Throttle plot updates
+        if current_time - self.last_plot_update < self.plot_update_interval:
             return
             
-        # Process all available metrics
-        updated = False
-        race_updated = False
+        self.updating_visualization = True
         
-        while not self.metrics_queue.empty():
-            try:
-                metric = self.metrics_queue.get_nowait()
+        try:
+            # Process metrics with limited batch size to prevent UI blocking
+            metrics_processed = 0
+            max_metrics_per_update = 10  # Limit processing per timer tick
+            
+            while not self.metrics_queue.empty() and metrics_processed < max_metrics_per_update:
+                try:
+                    metric = self.metrics_queue.get_nowait()
+                    
+                    # Handle metrics with iteration data
+                    if 'iteration' in metric:
+                        worker_id = metric.get('worker_id', 'main')
+                        iteration = metric['iteration']
+                        
+                        # Add metric data directly (already on main thread)
+                        self.iterations.append(iteration)
+                        self.rewards.append(metric.get('total_reward', metric.get('reward', 0)))
+                        self.policy_losses.append(metric.get('policy_loss', 0))
+                        self.value_losses.append(metric.get('value_loss', 0))
+                        
+                        metrics_processed += 1
+                        
+                    # Handle race state visualization with throttling
+                    elif 'race_state' in metric:
+                        worker_id = metric['race_state'].get('worker_id', 'main')
+                        
+                        # Throttle race visualization updates per worker
+                        if worker_id not in self.last_race_update:
+                            self.last_race_update[worker_id] = 0
+                            
+                        if current_time - self.last_race_update[worker_id] >= self.race_update_interval:
+                            self.update_race_visualization_throttled(metric['race_state'], worker_id)
+                            self.last_race_update[worker_id] = current_time
+                            self.add_worker_to_dropdown(worker_id)
+                        
+                        metrics_processed += 1
+                        
+                except queue.Empty:
+                    break
+            
+            # Update plots only if we processed metrics and enough time has passed
+            if metrics_processed > 0:
+                self.update_plots()
+                self.last_plot_update = current_time
                 
-                # Handle metrics with iteration data
-                if 'iteration' in metric:
-                    worker_id = metric.get('worker_id', 'main')
-                    iteration = metric['iteration']
-                    
-                    # For parallel training, we might get metrics from different workers
-                    # We'll use the iteration number directly
-                    self.iterations.append(iteration)
-                    self.rewards.append(metric.get('reward', 0))
-                    self.policy_losses.append(metric.get('policy_loss', 0))
-                    self.value_losses.append(metric.get('value_loss', 0))
-                    updated = True
-                    
-                    # Debug print
-                    print(f"Added metric from {worker_id}: iteration={iteration}, reward={metric.get('reward', 0):.4f}")
-                    
-                # Handle race state visualization
-                elif 'race_state' in metric:
-                    worker_id = metric['race_state'].get('worker_id', 'main')
-                    self.update_race_visualization(metric['race_state'], worker_id)
-                    race_updated = True
-                    
-                    # Add worker to dropdown if it's new
-                    self.add_worker_to_dropdown(worker_id)
-                    
-            except queue.Empty:
-                break
-        
-        if updated:
-            self.update_plots()
+        except Exception as e:
+            print(f"Error in on_timer: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.updating_visualization = False
+
+    def update_race_visualization_throttled(self, race_state, worker_id='main'):
+        """Update race visualization with throttling to prevent UI freezing"""
+        try:
+            # Store the race state for this worker
+            self.race_visualizations[worker_id] = race_state
+            
+            # Only update visualization if this worker is currently being displayed
+            should_update = False
+            
+            if self.active_worker_id == "All Environments":
+                should_update = True
+            elif self.active_worker_id == "Single Environment":
+                selection = self.single_worker_choice.GetSelection()
+                if selection != wx.NOT_FOUND:
+                    selected_worker = self.single_worker_choice.GetString(selection)
+                    should_update = (worker_id == selected_worker)
+            
+            if should_update:
+                # Use a separate thread for heavy matplotlib operations
+                threading.Thread(
+                    target=self._update_race_plot_async,
+                    args=(worker_id, race_state),
+                    daemon=True
+                ).start()
+                
+        except Exception as e:
+            print(f"Error in update_race_visualization_throttled: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _update_race_plot_async(self, worker_id, race_state):
+        """Update race plot in a separate thread and then update UI"""
+        try:
+            # This runs in a background thread
+            if self.active_worker_id == "All Environments":
+                if worker_id not in self.race_axes:
+                    # Schedule layout update on main thread
+                    wx.CallAfter(self.update_race_plot_layout)
+                else:
+                    # Schedule drawing update on main thread
+                    wx.CallAfter(self.draw_single_race_environment, worker_id, race_state)
+                    wx.CallAfter(self.race_canvas.draw_idle)  # Use draw_idle for better performance
+            elif self.active_worker_id == "Single Environment":
+                selection = self.single_worker_choice.GetSelection()
+                if selection != wx.NOT_FOUND:
+                    selected_worker = self.single_worker_choice.GetString(selection)
+                    if worker_id == selected_worker:
+                        wx.CallAfter(self.update_single_worker_visualization, worker_id)
+                        
+        except Exception as e:
+            print(f"Error in _update_race_plot_async: {e}")
+            import traceback
+            traceback.print_exc()
     
     def add_worker_to_dropdown(self, worker_id):
         """Add a worker to the dropdown if it's not already there"""
@@ -611,139 +759,38 @@ class VisualizationPanel(wx.Panel):
         self.draw_single_race_environment(worker_id, race_state)
         self.race_canvas.draw()
 
-    def add_metric(self, metric_dict):
-        """Add a metric to the queue (called from training thread)"""
-        try:
-            # Handle race state visualization
-            if 'race_state' in metric_dict:
-                race_state = metric_dict['race_state']
-                worker_id = race_state.get('worker_id', 'main')
-                
-                # Store the race state for this worker
-                wx.CallAfter(self.store_race_visualization, worker_id, race_state)
-                return
-                
-            # Handle metrics with iteration data
-            if 'iteration' in metric_dict:
-                worker_id = metric_dict.get('worker_id', 'main')
-                iteration = metric_dict['iteration']
-                
-                # For parallel training, we might get metrics from different workers
-                # We'll use the iteration number directly
-                wx.CallAfter(self._add_metric_data, 
-                            iteration, 
-                            metric_dict.get('reward', 0), 
-                            metric_dict.get('policy_loss', 0), 
-                            metric_dict.get('value_loss', 0))
-                
-                # Debug print
-                print(f"Added metric from {worker_id}: iteration={iteration}, reward={metric_dict.get('reward', 0):.4f}")
-        except Exception as e:
-            import traceback
-            print(f"Error in add_metric: {e}")
-            print(traceback.format_exc())
-
     def store_race_visualization(self, worker_id, race_state):
-        """Store race state for a specific worker (thread-safe)"""
+        """Store race state for a specific worker (thread-safe with queue)"""
         try:
-            # Ensure we're on the main thread
-            if not wx.IsMainThread():
-                wx.CallAfter(self.store_race_visualization, worker_id, race_state)
-                return
-            
-            # Store the race state
-            self.race_visualizations[worker_id] = race_state
-            
-            # Add worker to dropdown if it's new
-            self.add_worker_to_dropdown(worker_id)
-            
-            # Update visualization based on current selection
-            if self.active_worker_id == "All Environments":
-                # Check if we need to update layout (new worker added)
-                if worker_id not in self.race_axes:
-                    self.update_race_plot_layout()
-                else:
-                    # Just update this worker's plot
-                    self.draw_single_race_environment(worker_id, race_state)
-                    self.race_canvas.draw()
-            elif self.active_worker_id == "Single Environment":
-                # Update if this is the selected worker
-                selection = self.single_worker_choice.GetSelection()
-                if selection != wx.NOT_FOUND:
-                    selected_worker = self.single_worker_choice.GetString(selection)
-                    if worker_id == selected_worker:
-                        self.update_single_worker_visualization(worker_id)
-            
-            # Switch to the race visualization tab
-            self.plot_notebook.SetSelection(2)  # Index 2 is the Race Visualization tab
-            
-            # Debug output
-            pods_count = len(race_state.get('pods', []))
-            checkpoints_count = len(race_state.get('checkpoints', []))
-            print(f"Updated race visualization for {worker_id}: {pods_count} pods, {checkpoints_count} checkpoints")
-            
+            # Instead of using wx.CallAfter, put data in queue for processing by timer
+            if not self.metrics_queue.full():
+                self.metrics_queue.put({'race_state': race_state})
+            else:
+                # If queue is full, skip this update to prevent blocking
+                print(f"Visualization queue full, skipping race state update for {worker_id}")
+                
         except Exception as e:
             print(f"Error in store_race_visualization: {e}")
             import traceback
             traceback.print_exc()
 
     def add_metric(self, metric_dict):
-        """Add a metric to the queue (called from training thread)"""
+        """Add a metric to the queue (called from training thread) - non-blocking"""
         try:
-            # Handle race state visualization
-            if 'race_state' in metric_dict:
-                race_state = metric_dict['race_state']
-                worker_id = race_state.get('worker_id', 'main')
+            # Use non-blocking put to prevent training thread from being blocked
+            if not self.metrics_queue.full():
+                self.metrics_queue.put_nowait(metric_dict)
+            else:
+                # If queue is full, skip this metric to prevent blocking training
+                print("Visualization queue full, skipping metric update")
                 
-                # Store the race state for this worker (thread-safe)
-                self.store_race_visualization(worker_id, race_state)
-                return
-                
-            # Handle metrics with iteration data
-            if 'iteration' in metric_dict:
-                worker_id = metric_dict.get('worker_id', 'main')
-                iteration = metric_dict['iteration']
-                
-                # Add metric data (thread-safe)
-                wx.CallAfter(self._add_metric_data, 
-                            iteration, 
-                            metric_dict.get('reward', 0), 
-                            metric_dict.get('policy_loss', 0), 
-                            metric_dict.get('value_loss', 0))
-                
-                print(f"Added metric from {worker_id}: iteration={iteration}, reward={metric_dict.get('reward', 0):.4f}")
-                
+        except queue.Full:
+            # Queue is full, skip this update
+            pass
         except Exception as e:
             print(f"Error in add_metric: {e}")
             import traceback
             traceback.print_exc()
-
-    def update_race_visualization(self, race_state, worker_id='main'):
-        """Update the race visualization with new state data"""
-        try:
-            # Store the race state for this worker
-            self.race_visualizations[worker_id] = race_state
-            
-            # Update the visualization based on current mode
-            if self.active_worker_id == "All Environments":
-                # Update or create subplot for this worker
-                if worker_id not in self.race_axes:
-                    self.update_race_plot_layout()
-                else:
-                    self.draw_single_race_environment(worker_id, race_state)
-                    self.race_canvas.draw()
-            elif self.active_worker_id == "Single Environment":
-                # Update if this is the selected worker
-                selection = self.single_worker_choice.GetSelection()
-                if selection != wx.NOT_FOUND:
-                    selected_worker = self.single_worker_choice.GetString(selection)
-                    if worker_id == selected_worker:
-                        self.update_single_worker_visualization(worker_id)
-                
-        except Exception as e:
-            import traceback
-            print(f"Error in update_race_visualization: {e}")
-            print(traceback.format_exc())
 
     def load_training_data(self, model_dir):
         """Load training data from model directory"""
@@ -760,17 +807,27 @@ class VisualizationPanel(wx.Panel):
                 wx.MessageBox(f"Model directory does not exist: {model_dir}", "Directory Error", wx.OK | wx.ICON_ERROR)
                 return
             
-            # Check for model files - support both standard and GPU-specific filenames
-            standard_files_exist = (model_path / "player0_pod0.pt").exists() and (model_path / "player0_pod1.pt").exists()
+            # Check for model files - support both old and new naming conventions
+            # Old convention: player0_pod0.pt, player0_pod1.pt
+            old_standard_files_exist = (model_path / "player0_pod0.pt").exists() and (model_path / "player0_pod1.pt").exists()
             
-            # Look for GPU-specific model files (from parallel training)
-            gpu_files = list(model_path.glob("player0_pod0_gpu*.pt")) + list(model_path.glob("player0_pod0_gpu*_iter*.pt"))
-            gpu_files_exist = len(gpu_files) > 0
+            # New convention: player0_runner.pt, player0_blocker.pt
+            new_standard_files_exist = (model_path / "player0_runner.pt").exists() and (model_path / "player0_blocker.pt").exists()
             
-            if not (standard_files_exist or gpu_files_exist):
+            # Old GPU-specific files
+            old_gpu_files = list(model_path.glob("player0_pod0_gpu*.pt")) + list(model_path.glob("player0_pod0_gpu*_iter*.pt"))
+            old_gpu_files_exist = len(old_gpu_files) > 0
+            
+            # New GPU-specific files
+            new_gpu_files = list(model_path.glob("player0_runner_gpu*.pt")) + list(model_path.glob("player0_blocker_gpu*.pt"))
+            new_gpu_files_exist = len(new_gpu_files) > 0
+            
+            if not (old_standard_files_exist or new_standard_files_exist or old_gpu_files_exist or new_gpu_files_exist):
                 wx.MessageBox(f"Model files not found in directory: {model_dir}\n"
-                            f"Expected either standard files (player0_pod0.pt) or "
-                            f"GPU-specific files (player0_pod0_gpu0.pt)", 
+                            f"Expected either:\n"
+                            f"- Standard files: player0_runner.pt, player0_blocker.pt\n"
+                            f"- GPU-specific files: player0_runner_gpu0.pt, player0_blocker_gpu0.pt\n"
+                            f"- Legacy files: player0_pod0.pt, player0_pod1.pt", 
                             "Model Files Error", wx.OK | wx.ICON_ERROR)
             
             # Look for training log files - support both standard and GPU-specific logs
@@ -792,9 +849,17 @@ class VisualizationPanel(wx.Panel):
                             parts = line.strip().split(',')
                             if len(parts) >= 4:
                                 iteration = int(parts[0].split('=')[1])
-                                reward = float(parts[1].split('=')[1])
-                                policy_loss = float(parts[2].split('=')[1])
-                                value_loss = float(parts[3].split('=')[1])
+                                
+                                # Handle both old and new log formats
+                                if 'total_reward=' in line:
+                                    # New format with role-specific rewards
+                                    reward = float([p for p in parts if p.startswith('total_reward=')][0].split('=')[1])
+                                else:
+                                    # Old format
+                                    reward = float(parts[1].split('=')[1])
+                                
+                                policy_loss = float([p for p in parts if p.startswith('policy_loss=')][0].split('=')[1])
+                                value_loss = float([p for p in parts if p.startswith('value_loss=')][0].split('=')[1])
                                 
                                 self.iterations.append(iteration)
                                 self.rewards.append(reward)
@@ -819,34 +884,7 @@ class VisualizationPanel(wx.Panel):
             import traceback
             error_details = traceback.format_exc()
             wx.MessageBox(f"Error loading training data: {str(e)}\n\nDetails:\n{error_details}", 
-                        "Data Loading Error", wx.OK | wx.ICON_ERROR)
-    
-    def on_browse(self, event):
-        """Browse for model directory"""
-        with wx.DirDialog(self, "Select Model Directory") as dlg:
-            if dlg.ShowModal() == wx.ID_OK:
-                path = dlg.GetPath()
-                self.model_dir_ctrl.SetValue(path)
-                self.load_training_data(path)
-    
-    def on_refresh(self, event):
-        """Refresh training data"""
-        model_dir = self.model_dir_ctrl.GetValue()
-        if model_dir:
-            self.load_training_data(model_dir)
-    
-    def find_best_model_file(self, pod_name, model_path):
-        """Find the best model file based on selection strategy"""
-        selection = self.model_selection_choice.GetSelection()
-        strategy = self.model_selection_choice.GetString(selection)
-        
-        if strategy == "Manual Select":
-            return self.get_manual_selected_model(pod_name, model_path)
-        elif strategy == "Latest Iteration":
-            return self.find_latest_model_file(pod_name, model_path)
-        else:  # Best Performance
-            return self.find_best_performance_model_file(pod_name, model_path)
-    
+                        "Data Loading Error", wx.OK | wx.ICON_ERROR)    
     def get_manual_selected_model(self, pod_name, model_path):
         """Get manually selected model file"""
         selection = self.manual_model_choice.GetSelection()
@@ -867,19 +905,70 @@ class VisualizationPanel(wx.Panel):
         # Fallback to best performance if manual selection doesn't match
         return self.find_best_performance_model_file(pod_name, model_path)
     
-    def find_latest_model_file(self, pod_name, model_path):
-        """Find the latest model file by iteration number"""
-        # First try standard filename
-        standard_file = model_path / f"{pod_name}.pt"
-        if standard_file.exists():
-            return standard_file
+    def find_best_model_file(self, pod_key, model_path):
+        """Find the best model file based on selection strategy"""
+        selection = self.model_selection_choice.GetSelection()
+        strategy = self.model_selection_choice.GetString(selection)
         
-        # Collect all iteration files for this pod
-        iter_files = list(model_path.glob(f"{pod_name}_gpu*_iter*.pt"))
+        if strategy == "Manual Select":
+            return self.get_manual_selected_model(pod_key, model_path)
+        elif strategy == "Latest Iteration":
+            return self.find_latest_model_file(pod_key, model_path)
+        else:  # Best Performance
+            return self.find_best_performance_model_file(pod_key, model_path)
+    def get_manual_selected_model(self, pod_key, model_path):
+        """Get manually selected model file"""
+        selection = self.manual_model_choice.GetSelection()
+        if selection == wx.NOT_FOUND:
+            return None
+            
+        selected_text = self.manual_model_choice.GetString(selection)
+        
+        # Extract filename from the display text
+        if ": " in selected_text:
+            filename = selected_text.split(": ", 1)[1]
+            model_file = model_path / filename
+            
+            # Check if this file matches the requested pod (convert pod_key to role if needed)
+            role = self.pod_key_to_role(pod_key)
+            if (role in filename or pod_key in filename) and model_file.exists():
+                return model_file
+        
+        # Fallback to best performance if manual selection doesn't match
+        return self.find_best_performance_model_file(pod_key, model_path)
+
+    def pod_key_to_role(self, pod_key):
+        """Convert pod_key to role name"""
+        if "pod0" in pod_key:
+            return "runner"
+        elif "pod1" in pod_key:
+            return "blocker"
+        return pod_key  # Return as-is if already in new format
+
+    def find_latest_model_file(self, pod_key, model_path):
+        """Find the latest model file by iteration number"""
+        role = self.pod_key_to_role(pod_key)
+        
+        # Try new standard filename first
+        new_standard_file = model_path / f"player0_{role}.pt"
+        if new_standard_file.exists():
+            return new_standard_file
+        
+        # Try legacy standard filename
+        legacy_standard_file = model_path / f"{pod_key}.pt"
+        if legacy_standard_file.exists():
+            return legacy_standard_file
+        
+        # Collect all iteration files for this role/pod
+        new_iter_files = list(model_path.glob(f"player0_{role}_gpu*_iter*.pt"))
+        legacy_iter_files = list(model_path.glob(f"{pod_key}_gpu*_iter*.pt"))
+        iter_files = new_iter_files + legacy_iter_files
         
         if not iter_files:
             # Try GPU files without iteration
-            gpu_files = list(model_path.glob(f"{pod_name}_gpu*.pt"))
+            new_gpu_files = list(model_path.glob(f"player0_{role}_gpu*.pt"))
+            legacy_gpu_files = list(model_path.glob(f"{pod_key}_gpu*.pt"))
+            gpu_files = new_gpu_files + legacy_gpu_files
             return gpu_files[0] if gpu_files else None
         
         # Sort by iteration number and return the latest
@@ -896,24 +985,39 @@ class VisualizationPanel(wx.Panel):
             return iter_files_with_numbers[0][1]
         
         return None
-    
-    def find_best_performance_model_file(self, pod_name, model_path):
-        """Find the best model file based on training performance"""
-        # First try standard filename (usually the final/best model)
-        standard_file = model_path / f"{pod_name}.pt"
-        if standard_file.exists():
-            return standard_file
         
-        # Collect all possible model files for this pod
+    def find_best_performance_model_file(self, pod_key, model_path):
+        """Find the best model file based on training performance"""
+        role = self.pod_key_to_role(pod_key)
+        
+        # Try new standard filename first (usually the final/best model)
+        new_standard_file = model_path / f"player0_{role}.pt"
+        if new_standard_file.exists():
+            return new_standard_file
+        
+        # Try legacy standard filename
+        legacy_standard_file = model_path / f"{pod_key}.pt"
+        if legacy_standard_file.exists():
+            return legacy_standard_file
+        
+        # Collect all possible model files for this role/pod
         all_model_files = []
         
-        # GPU-specific files without iteration (usually latest/best)
-        gpu_files = list(model_path.glob(f"{pod_name}_gpu*.pt"))
-        all_model_files.extend(gpu_files)
+        # New GPU-specific files without iteration (usually latest/best)
+        new_gpu_files = list(model_path.glob(f"player0_{role}_gpu*.pt"))
+        all_model_files.extend(new_gpu_files)
         
-        # GPU-specific files with iteration
-        iter_files = list(model_path.glob(f"{pod_name}_gpu*_iter*.pt"))
-        all_model_files.extend(iter_files)
+        # Legacy GPU-specific files without iteration
+        legacy_gpu_files = list(model_path.glob(f"{pod_key}_gpu*.pt"))
+        all_model_files.extend(legacy_gpu_files)
+        
+        # New GPU-specific files with iteration
+        new_iter_files = list(model_path.glob(f"player0_{role}_gpu*_iter*.pt"))
+        all_model_files.extend(new_iter_files)
+        
+        # Legacy GPU-specific files with iteration
+        legacy_iter_files = list(model_path.glob(f"{pod_key}_gpu*_iter*.pt"))
+        all_model_files.extend(legacy_iter_files)
         
         if not all_model_files:
             return None
@@ -940,7 +1044,7 @@ class VisualizationPanel(wx.Panel):
         
         # Final fallback: return the first file
         return all_model_files[0]
-
+    
     def find_best_model_from_logs(self, model_files, model_path):
         """Find the best model based on training log performance"""
         # Look for training log files
@@ -1021,17 +1125,27 @@ class VisualizationPanel(wx.Panel):
             wx.MessageBox(f"Model directory does not exist: {model_dir}", "Visualization Error", wx.OK | wx.ICON_ERROR)
             return
         
-        # Check if model files exist - support both standard and GPU-specific filenames
-        standard_files_exist = (model_path / "player0_pod0.pt").exists() and (model_path / "player0_pod1.pt").exists()
+        # Check if model files exist - support both old and new naming conventions
+        # New convention: player0_runner.pt, player0_blocker.pt
+        new_standard_files_exist = (model_path / "player0_runner.pt").exists() and (model_path / "player0_blocker.pt").exists()
         
-        # Look for GPU-specific model files (from parallel training)
-        gpu_files = list(model_path.glob("player0_pod0_gpu*.pt")) + list(model_path.glob("player0_pod1_gpu*.pt"))
-        gpu_files_exist = len(gpu_files) >= 2  # Need at least one file for each pod
+        # Old convention: player0_pod0.pt, player0_pod1.pt
+        old_standard_files_exist = (model_path / "player0_pod0.pt").exists() and (model_path / "player0_pod1.pt").exists()
         
-        if not (standard_files_exist or gpu_files_exist):
+        # New GPU-specific model files (from parallel training)
+        new_gpu_files = list(model_path.glob("player0_runner_gpu*.pt")) + list(model_path.glob("player0_blocker_gpu*.pt"))
+        new_gpu_files_exist = len(new_gpu_files) >= 2  # Need at least one file for each role
+        
+        # Old GPU-specific model files
+        old_gpu_files = list(model_path.glob("player0_pod0_gpu*.pt")) + list(model_path.glob("player0_pod1_gpu*.pt"))
+        old_gpu_files_exist = len(old_gpu_files) >= 2  # Need at least one file for each pod
+        
+        if not (new_standard_files_exist or old_standard_files_exist or new_gpu_files_exist or old_gpu_files_exist):
             wx.MessageBox(f"Model files not found in directory: {model_dir}\n"
-                        f"Expected either standard files (player0_pod0.pt) or "
-                        f"GPU-specific files (player0_pod0_gpu0.pt)", 
+                        f"Expected either:\n"
+                        f"- New format: player0_runner.pt, player0_blocker.pt\n"
+                        f"- GPU format: player0_runner_gpu0.pt, player0_blocker_gpu0.pt\n"
+                        f"- Legacy format: player0_pod0.pt, player0_pod1.pt", 
                         "Visualization Error", wx.OK | wx.ICON_ERROR)
             return
         
@@ -1066,7 +1180,7 @@ class VisualizationPanel(wx.Panel):
             # Get observation dimension from the environment
             obs_dim = next(iter(observations.values())).shape[1]
 
-            # Load player 0 models
+            # Load player 0 models - support both new and old naming conventions
             model_path = Path(model_dir)
             
             # Function to create network with matching architecture
@@ -1112,23 +1226,28 @@ class VisualizationPanel(wx.Panel):
                 
                 return network, checkpoint
             
-            # Load player 0 models
+            # Load player 0 models - try both new and old naming conventions
             for i in range(2):
+                # Determine role and pod_key
+                role = "runner" if i == 0 else "blocker"
                 pod_key = f"player0_pod{i}"
+                
+                # Try to find model file using the new find_best_model_file method
                 model_file = self.find_best_model_file(pod_key, model_path)
+                
                 if model_file:
                     try:
                         network, checkpoint = create_network_from_checkpoint(model_file)
                         network.load_state_dict(checkpoint)
                         network.eval()
                         pod_networks[pod_key] = network
-                        wx.CallAfter(self.sim_results.AppendText, f"Loaded model from {model_file.name}\n")
+                        wx.CallAfter(self.sim_results.AppendText, f"Loaded {role} model from {model_file.name}\n")
                     except Exception as e:
-                        wx.CallAfter(self.sim_results.AppendText, f"Error loading {pod_key} from {model_file}: {str(e)}\n")
+                        wx.CallAfter(self.sim_results.AppendText, f"Error loading {role} from {model_file}: {str(e)}\n")
                         # Create a default network as fallback
                         pod_networks[pod_key] = PodNetwork(observation_dim=obs_dim).to('cpu')
                 else:
-                    wx.CallAfter(self.sim_results.AppendText, f"No model found for {pod_key}\n")
+                    wx.CallAfter(self.sim_results.AppendText, f"No model found for {role} (pod{i})\n")
                     # Create a default network
                     pod_networks[pod_key] = PodNetwork(observation_dim=obs_dim).to('cpu')
             
@@ -1142,6 +1261,7 @@ class VisualizationPanel(wx.Panel):
                     source_network = pod_networks[source_pod_key]
                     
                     # Create new network with same architecture
+                    role = "runner" if i == 0 else "blocker"
                     model_file = self.find_best_model_file(source_pod_key, model_path)
                     if model_file:
                         try:
@@ -1150,7 +1270,7 @@ class VisualizationPanel(wx.Panel):
                             network.eval()
                             pod_networks[pod_key] = network
                         except Exception as e:
-                            wx.CallAfter(self.sim_results.AppendText, f"Error loading {pod_key}: {str(e)}\n")
+                            wx.CallAfter(self.sim_results.AppendText, f"Error loading {role} for player1: {str(e)}\n")
                             # Use default network as fallback
                             pod_networks[pod_key] = PodNetwork(observation_dim=obs_dim).to('cpu')
                     else:
@@ -1221,13 +1341,13 @@ class VisualizationPanel(wx.Panel):
                             race_state['pods'].append(pod_info)
 
                     # Update visualization
-                    wx.CallAfter(self.update_race_visualization, race_state, 'visualization')
+                    wx.CallAfter(self.update_race_visualization_throttled, race_state, 'visualization')
                     
                     # Small delay to make visualization visible
                     time.sleep(0.1) 
             
             # Final update
-            wx.CallAfter(self.update_race_visualization, race_state, 'visualization')
+            wx.CallAfter(self.update_race_visualization_throttled, race_state, 'visualization')
             
         except Exception as e:
             import traceback
@@ -1237,7 +1357,7 @@ class VisualizationPanel(wx.Panel):
         
         finally:
             wx.CallAfter(self.visualize_race_btn.Enable)
-    
+
     def on_run_simulation(self, event):
         """Run a simulation with the selected model"""
         model_dir = self.model_dir_ctrl.GetValue()
@@ -1251,17 +1371,27 @@ class VisualizationPanel(wx.Panel):
             wx.MessageBox(f"Model directory does not exist: {model_dir}", "Simulation Error", wx.OK | wx.ICON_ERROR)
             return
         
-        # Check if model files exist - support both standard and GPU-specific filenames
-        standard_files_exist = (model_path / "player0_pod0.pt").exists() and (model_path / "player0_pod1.pt").exists()
+        # Check if model files exist - support both old and new naming conventions
+        # New convention: player0_runner.pt, player0_blocker.pt
+        new_standard_files_exist = (model_path / "player0_runner.pt").exists() and (model_path / "player0_blocker.pt").exists()
         
-        # Look for GPU-specific model files (from parallel training)
-        gpu_files = list(model_path.glob("player0_pod0_gpu*.pt")) + list(model_path.glob("player0_pod1_gpu*.pt"))
-        gpu_files_exist = len(gpu_files) >= 2  # Need at least one file for each pod
+        # Old convention: player0_pod0.pt, player0_pod1.pt
+        old_standard_files_exist = (model_path / "player0_pod0.pt").exists() and (model_path / "player0_pod1.pt").exists()
         
-        if not (standard_files_exist or gpu_files_exist):
+        # New GPU-specific model files
+        new_gpu_files = list(model_path.glob("player0_runner_gpu*.pt")) + list(model_path.glob("player0_blocker_gpu*.pt"))
+        new_gpu_files_exist = len(new_gpu_files) >= 2  # Need at least one file for each role
+        
+        # Old GPU-specific model files
+        old_gpu_files = list(model_path.glob("player0_pod0_gpu*.pt")) + list(model_path.glob("player0_pod1_gpu*.pt"))
+        old_gpu_files_exist = len(old_gpu_files) >= 2  # Need at least one file for each pod
+        
+        if not (new_standard_files_exist or old_standard_files_exist or new_gpu_files_exist or old_gpu_files_exist):
             wx.MessageBox(f"Model files not found in directory: {model_dir}\n"
-                        f"Expected either standard files (player0_pod0.pt) or "
-                        f"GPU-specific files (player0_pod0_gpu0.pt)", 
+                        f"Expected either:\n"
+                        f"- New format: player0_runner.pt, player0_blocker.pt\n"
+                        f"- GPU format: player0_runner_gpu0.pt, player0_blocker_gpu0.pt\n"
+                        f"- Legacy format: player0_pod0.pt, player0_pod1.pt", 
                         "Simulation Error", wx.OK | wx.ICON_ERROR)
             return
         
@@ -1273,7 +1403,7 @@ class VisualizationPanel(wx.Panel):
         sim_thread = threading.Thread(target=self.run_simulation, args=(model_dir,))
         sim_thread.daemon = True
         sim_thread.start()
-    
+
     def run_simulation(self, model_dir):
         """Run simulation with the selected model"""
         try:
@@ -1338,9 +1468,13 @@ class VisualizationPanel(wx.Panel):
                 
                 return network, checkpoint
             
-            # Load models for player 0
+            # Load models for player 0 - support both new and old naming conventions
             for i in range(2):
+                # Determine role and pod_key
+                role = "runner" if i == 0 else "blocker"
                 pod_key = f"player0_pod{i}"
+                
+                # Try to find model file using the new find_best_model_file method
                 model_file = self.find_best_model_file(pod_key, model_path)
                 
                 if model_file:
@@ -1349,13 +1483,13 @@ class VisualizationPanel(wx.Panel):
                         network.load_state_dict(checkpoint)
                         network.eval()
                         pod_networks[pod_key] = network
-                        wx.CallAfter(self.sim_results.AppendText, f"Loaded model from {model_file.name}\n")
+                        wx.CallAfter(self.sim_results.AppendText, f"Loaded {role} model from {model_file.name}\n")
                     except Exception as e:
-                        wx.CallAfter(self.sim_results.AppendText, f"Error loading {pod_key} from {model_file}: {str(e)}\n")
+                        wx.CallAfter(self.sim_results.AppendText, f"Error loading {role} from {model_file}: {str(e)}\n")
                         # Create a default network as fallback
                         pod_networks[pod_key] = PodNetwork(observation_dim=obs_dim).to('cpu')
                 else:
-                    wx.CallAfter(self.sim_results.AppendText, f"No model found for {pod_key}, using random initialization\n")
+                    wx.CallAfter(self.sim_results.AppendText, f"No model found for {role} (pod{i}), using random initialization\n")
                     # Create a default network
                     pod_networks[pod_key] = PodNetwork(observation_dim=obs_dim).to('cpu')
             
@@ -1365,6 +1499,7 @@ class VisualizationPanel(wx.Panel):
                 source_pod_key = f"player0_pod{i}"
                 
                 # Use player0's model for player1
+                role = "runner" if i == 0 else "blocker"
                 model_file = self.find_best_model_file(source_pod_key, model_path)
                 
                 if model_file:
@@ -1374,7 +1509,7 @@ class VisualizationPanel(wx.Panel):
                         network.eval()
                         pod_networks[pod_key] = network
                     except Exception as e:
-                        wx.CallAfter(self.sim_results.AppendText, f"Error loading {pod_key}: {str(e)}\n")
+                        wx.CallAfter(self.sim_results.AppendText, f"Error loading {role} for player1: {str(e)}\n")
                         # Use default network as fallback
                         pod_networks[pod_key] = PodNetwork(observation_dim=obs_dim).to('cpu')
                 else:
@@ -1388,6 +1523,12 @@ class VisualizationPanel(wx.Panel):
             
             player0_wins = 0
             player1_wins = 0
+            
+            # Track role-specific performance
+            runner_wins = 0
+            blocker_wins = 0
+            total_runner_progress = 0
+            total_blocker_progress = 0
             
             for i in range(iterations):
                 wx.CallAfter(self.sim_results.AppendText, f"Race {i+1}/{iterations}...\n")
@@ -1413,27 +1554,79 @@ class VisualizationPanel(wx.Panel):
                     # Step the environment
                     observations, _, done, info = env.step(actions)
                 
-                # Determine winner
-                player0_progress = max(
-                    info["checkpoint_progress"][0][0].item(),
-                    info["checkpoint_progress"][1][0].item()
-                )
-                player1_progress = max(
-                    info["checkpoint_progress"][2][0].item(),
-                    info["checkpoint_progress"][3][0].item()
-                )
+                # Determine winner and track role-specific performance
+                player0_runner_progress = info["checkpoint_progress"][0][0].item()  # player0_pod0 (runner)
+                player0_blocker_progress = info["checkpoint_progress"][1][0].item()  # player0_pod1 (blocker)
+                player1_runner_progress = info["checkpoint_progress"][2][0].item()   # player1_pod0 (runner)
+                player1_blocker_progress = info["checkpoint_progress"][3][0].item()  # player1_pod1 (blocker)
                 
-                if player0_progress > player1_progress:
+                # Track overall progress for roles
+                total_runner_progress += max(player0_runner_progress, player1_runner_progress)
+                total_blocker_progress += max(player0_blocker_progress, player1_blocker_progress)
+                
+                # Determine which player's best pod performed better
+                player0_best_progress = max(player0_runner_progress, player0_blocker_progress)
+                player1_best_progress = max(player1_runner_progress, player1_blocker_progress)
+                
+                if player0_best_progress > player1_best_progress:
                     player0_wins += 1
-                    wx.CallAfter(self.sim_results.AppendText, f"  Result: Player 0 wins! Progress: {player0_progress} vs {player1_progress}\n")
+                    # Determine which role won for player0
+                    if player0_runner_progress > player0_blocker_progress:
+                        runner_wins += 1
+                        winning_role = "runner"
+                    else:
+                        blocker_wins += 1
+                        winning_role = "blocker"
+                    wx.CallAfter(self.sim_results.AppendText, 
+                               f"  Result: Player 0 wins with {winning_role}! "
+                               f"Progress: {player0_best_progress:.3f} vs {player1_best_progress:.3f}\n")
                 else:
                     player1_wins += 1
-                    wx.CallAfter(self.sim_results.AppendText, f"  Result: Player 1 wins! Progress: {player1_progress} vs {player0_progress}\n")
+                    # Determine which role won for player1
+                    if player1_runner_progress > player1_blocker_progress:
+                        runner_wins += 1
+                        winning_role = "runner"
+                    else:
+                        blocker_wins += 1
+                        winning_role = "blocker"
+                    wx.CallAfter(self.sim_results.AppendText, 
+                               f"  Result: Player 1 wins with {winning_role}! "
+                               f"Progress: {player1_best_progress:.3f} vs {player0_best_progress:.3f}\n")
+                
+                # Show detailed progress for this race
+                wx.CallAfter(self.sim_results.AppendText, 
+                           f"    P0 Runner: {player0_runner_progress:.3f}, P0 Blocker: {player0_blocker_progress:.3f}\n")
+                wx.CallAfter(self.sim_results.AppendText, 
+                           f"    P1 Runner: {player1_runner_progress:.3f}, P1 Blocker: {player1_blocker_progress:.3f}\n")
+            
+            # Calculate averages
+            avg_runner_progress = total_runner_progress / iterations
+            avg_blocker_progress = total_blocker_progress / iterations
             
             # Show final results
-            wx.CallAfter(self.sim_results.AppendText, f"\nFinal Results:\n")
-            wx.CallAfter(self.sim_results.AppendText, f"Player 0 wins: {player0_wins}/{iterations} ({player0_wins/iterations*100:.1f}%)\n")
-            wx.CallAfter(self.sim_results.AppendText, f"Player 1 wins: {player1_wins}/{iterations} ({player1_wins/iterations*100:.1f}%)\n")
+            wx.CallAfter(self.sim_results.AppendText, f"\n" + "="*50 + "\n")
+            wx.CallAfter(self.sim_results.AppendText, f"FINAL SIMULATION RESULTS\n")
+            wx.CallAfter(self.sim_results.AppendText, f"="*50 + "\n")
+            
+            wx.CallAfter(self.sim_results.AppendText, f"Player Performance:\n")
+            wx.CallAfter(self.sim_results.AppendText, f"  Player 0 wins: {player0_wins}/{iterations} ({player0_wins/iterations*100:.1f}%)\n")
+            wx.CallAfter(self.sim_results.AppendText, f"  Player 1 wins: {player1_wins}/{iterations} ({player1_wins/iterations*100:.1f}%)\n")
+            
+            wx.CallAfter(self.sim_results.AppendText, f"\nRole Performance:\n")
+            wx.CallAfter(self.sim_results.AppendText, f"  Runner wins: {runner_wins}/{iterations} ({runner_wins/iterations*100:.1f}%)\n")
+            wx.CallAfter(self.sim_results.AppendText, f"  Blocker wins: {blocker_wins}/{iterations} ({blocker_wins/iterations*100:.1f}%)\n")
+            
+            wx.CallAfter(self.sim_results.AppendText, f"\nAverage Progress:\n")
+            wx.CallAfter(self.sim_results.AppendText, f"  Average Runner Progress: {avg_runner_progress:.3f}\n")
+            wx.CallAfter(self.sim_results.AppendText, f"  Average Blocker Progress: {avg_blocker_progress:.3f}\n")
+            
+            # Determine which role is more effective
+            if avg_runner_progress > avg_blocker_progress:
+                wx.CallAfter(self.sim_results.AppendText, f"\nRunner strategy appears more effective (+{avg_runner_progress - avg_blocker_progress:.3f})\n")
+            elif avg_blocker_progress > avg_runner_progress:
+                wx.CallAfter(self.sim_results.AppendText, f"\nBlocker strategy appears more effective (+{avg_blocker_progress - avg_runner_progress:.3f})\n")
+            else:
+                wx.CallAfter(self.sim_results.AppendText, f"\nBoth strategies perform equally well\n")
             
         except Exception as e:
             import traceback

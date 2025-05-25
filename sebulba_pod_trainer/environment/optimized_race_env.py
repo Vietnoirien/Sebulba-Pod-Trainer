@@ -263,12 +263,15 @@ class OptimizedRaceEnvironment:
         for opp_idx in range(2):
             opp_pod = self.pods[opponent_player_idx * 2 + opp_idx]
             
-            # Get opponent's next checkpoint
-            opp_next_cp_idx = opp_pod.current_checkpoint % self.num_checkpoints
+            # Get opponent's next checkpoint using batch-specific counts
             opp_next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
             for b in range(self.batch_size):
-                opp_next_cp_pos[b] = self.checkpoints[b, opp_next_cp_idx[b].item()]
-            
+                num_cp = self.batch_checkpoint_counts[b].item()
+                opp_next_cp_idx = opp_pod.current_checkpoint[b] % num_cp
+                # Ensure the index is within bounds
+                opp_next_cp_idx = min(opp_next_cp_idx, num_cp - 1)
+                opp_next_cp_pos[b] = self.checkpoints[b, opp_next_cp_idx]
+
             # Calculate if blocker can intercept opponent's path
             opp_to_cp = opp_next_cp_pos - opp_pod.position
             blocker_to_cp = opp_next_cp_pos - blocker.position
@@ -298,12 +301,14 @@ class OptimizedRaceEnvironment:
         # Get next checkpoint positions (vectorized)
         next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
         for b in range(self.batch_size):
-            next_cp_pos[b] = self.checkpoints[b, next_cp_idx[b].item()]
+            idx = min(next_cp_idx[b].item(), self.batch_checkpoint_counts[b].item() - 1)
+            next_cp_pos[b] = self.checkpoints[b, idx]
         
         # Get next-next checkpoint positions (vectorized)
         next_next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
         for b in range(self.batch_size):
-            next_next_cp_pos[b] = self.checkpoints[b, next_next_cp_idx[b].item()]
+            idx = min(next_next_cp_idx[b].item(), self.batch_checkpoint_counts[b].item() - 1)
+            next_next_cp_pos[b] = self.checkpoints[b, idx]
         
         # Reuse cached tensors for normalization
         # Normalize positions (in-place operations)
@@ -397,8 +402,11 @@ class OptimizedRaceEnvironment:
                 opp_progress = opp_pod.current_checkpoint.float() / batch_total_checkpoints.float().unsqueeze(1)
                 
                 # Opponent's next checkpoint
-                opp_next_cp_normalized = (opp_pod.current_checkpoint % self.num_checkpoints).float() / self.num_checkpoints
-                
+                opp_next_cp_normalized = torch.zeros(self.batch_size, 1, device=self.device)
+                for b in range(self.batch_size):
+                    num_cp = self.batch_checkpoint_counts[b].item()
+                    opp_next_cp_normalized[b] = (opp_pod.current_checkpoint[b] % num_cp).float() / num_cp
+
                 # Add to list for single concatenation (10 dimensions per opponent)
                 opponent_obs_list.append(torch.cat([
                     normalized_rel_pos,                    # (2)
@@ -440,13 +448,14 @@ class OptimizedRaceEnvironment:
                 angle_target = action[:, 0].unsqueeze(1)  # [-1, 1]
                 thrust_value = action[:, 1].unsqueeze(1)  # [0, 1] or special values
                 
-                # Get next checkpoint position
-                next_cp_idx = pod.current_checkpoint % self.num_checkpoints
-                
-                # Vectorized gathering of checkpoint positions
+                # Get next checkpoint position using batch-specific counts
                 next_cp_positions = torch.zeros(self.batch_size, 2, device=self.device)
                 for b in range(self.batch_size):
-                    next_cp_positions[b] = self.checkpoints[b, next_cp_idx[b].item()]
+                    num_cp = self.batch_checkpoint_counts[b].item()
+                    next_cp_idx = pod.current_checkpoint[b] % num_cp
+                    # Ensure the index is within bounds
+                    next_cp_idx = min(next_cp_idx.item(), num_cp - 1)
+                    next_cp_positions[b] = self.checkpoints[b, next_cp_idx]
                 
                 # Calculate target angle
                 base_angle = pod.angle_to(next_cp_positions)
@@ -623,6 +632,8 @@ class OptimizedRaceEnvironment:
             for b in range(self.batch_size):
                 num_cp = self.batch_checkpoint_counts[b].item()
                 next_cp_idx = pod.current_checkpoint[b] % num_cp
+                # Ensure the index is within bounds
+                next_cp_idx = min(next_cp_idx, num_cp - 1)
                 positions[b] = self.checkpoints[b, next_cp_idx]
             
             next_cp_positions[pod_idx] = positions
@@ -719,12 +730,15 @@ class OptimizedRaceEnvironment:
         total_blocking_reward = torch.zeros(self.batch_size, 1, device=self.device)
         
         for opp_pod in opponent_pods:
-            # Get opponent's next checkpoint
-            opp_next_cp_idx = opp_pod.current_checkpoint % self.num_checkpoints
+            # Get opponent's next checkpoint using batch-specific counts
             opp_next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
             for b in range(self.batch_size):
-                opp_next_cp_pos[b] = self.checkpoints[b, opp_next_cp_idx[b].item()]
-            
+                num_cp = self.batch_checkpoint_counts[b].item()
+                opp_next_cp_idx = opp_pod.current_checkpoint[b] % num_cp
+                # Ensure the index is within bounds
+                opp_next_cp_idx = min(opp_next_cp_idx.item(), num_cp - 1)
+                opp_next_cp_pos[b] = self.checkpoints[b, opp_next_cp_idx]
+
             # Reward for being between opponent and their checkpoint
             opp_to_cp = opp_next_cp_pos - opp_pod.position
             opp_to_blocker = blocker.position - opp_pod.position
@@ -763,12 +777,12 @@ class OptimizedRaceEnvironment:
         
         return 0.3 * coordination_reward + 0.2 * leadership_reward
 
-        def get_checkpoints(self):
-            """Return checkpoint positions for visualization"""
-            if self.checkpoints is not None:
-                # Return first batch's checkpoints
-                return self.checkpoints[0].cpu().numpy().tolist()
-            return []
+    def get_checkpoints(self):
+        """Return checkpoint positions for visualization"""
+        if self.checkpoints is not None:
+            # Return first batch's checkpoints
+            return self.checkpoints[0].cpu().numpy().tolist()
+        return []
     
     def get_pod_states(self):
         """Get current pod states for visualization"""

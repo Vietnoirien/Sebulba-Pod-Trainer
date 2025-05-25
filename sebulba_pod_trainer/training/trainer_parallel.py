@@ -10,16 +10,37 @@ import numpy as np
 from copy import deepcopy
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
-
+import random
 
 from ..environment.race_env import RaceEnvironment
 from ..environment.optimized_race_env import OptimizedRaceEnvironment
 from .trainer import PPOTrainer
 from .optimized_trainer import OptimizedPPOTrainer
 
+class SharedExperienceBuffer:
+    """Shared experience buffer across workers"""
+    def __init__(self, manager, buffer_size=10000):
+        self.buffer = manager.list()
+        self.buffer_size = buffer_size
+        self.lock = manager.Lock()
+    
+    def add_experience(self, experience):
+        with self.lock:
+            self.buffer.append(experience)
+            if len(self.buffer) > self.buffer_size:
+                self.buffer.pop(0)  # Remove oldest experience
+    
+    def sample_experiences(self, batch_size=64):
+        with self.lock:
+            if len(self.buffer) < batch_size:
+                return list(self.buffer)
+            
+            return random.sample(list(self.buffer), batch_size)
+
 class ParallelPPOTrainer:
     """
     Parallelized PPO Trainer that runs multiple environments across available GPUs
+    with model synchronization for improved convergence
     """
     def __init__(self, env_config, trainer_args, envs_per_gpu=8):
         # Set the start method for multiprocessing to 'spawn'
@@ -40,6 +61,13 @@ class ParallelPPOTrainer:
         self.processes = []
         self.use_mixed_precision = self.trainer_args.get('use_mixed_precision', True)
 
+        # Add synchronization parameters
+        self.sync_interval = self.trainer_args.get('sync_interval', 5)  # Sync every N iterations
+        self.use_parameter_server = self.trainer_args.get('use_parameter_server', True)
+        self.shared_experience_buffer = self.trainer_args.get('shared_experience_buffer', False)
+        self.gradient_aggregation = self.trainer_args.get('gradient_aggregation', True)
+        self.adaptive_lr = self.trainer_args.get('adaptive_lr', True)
+
         # Print trainer args for debugging
         print(f"ParallelPPOTrainer initialized with args: {self.trainer_args}")
         print(f"Training iterations: {self.trainer_args.get('num_iterations', 'NOT FOUND')}")
@@ -47,16 +75,23 @@ class ParallelPPOTrainer:
         print(f"Using devices: {self.devices}")
         print(f"Number of GPUs: {self.num_gpus}")
         print(f"Environments per GPU: {self.envs_per_gpu}")
+        print(f"Sync interval: {self.sync_interval}")
+        print(f"Parameter server: {self.use_parameter_server}")
+        print(f"Shared experience: {self.shared_experience_buffer}")
+        print(f"Gradient aggregation: {self.gradient_aggregation}")
         
         # Calculate total number of environments
         self.total_envs = self.num_gpus * self.envs_per_gpu
         print(f"Total environments: {self.total_envs}")
     
     @staticmethod
-    def _worker(gpu_id, env_indices, env_config, trainer_args, total_envs, envs_per_gpu, use_mixed_precision, shared_results, vis_queue=None):
-        """Worker process that runs multiple environments on a single GPU with optional visualization"""
+    def _worker(gpu_id, env_indices, env_config, trainer_args, total_envs, envs_per_gpu, 
+                use_mixed_precision, shared_results, vis_queue=None, shared_models=None, 
+                shared_experience=None, shared_metrics=None, sync_interval=5, 
+                gradient_aggregation=True, adaptive_lr=True, num_gpus=1):
+        """Enhanced worker process with model synchronization and experience sharing"""
         try:
-            print(f"Worker process for GPU {gpu_id} starting...")
+            print(f"Worker process for GPU {gpu_id} starting with synchronization...")
             # Set CUDA device for this process
             try:
                 torch.cuda.set_device(gpu_id)
@@ -119,11 +154,12 @@ class ParallelPPOTrainer:
                 if param in trainer_args:
                     trainer_init_args[param] = trainer_args[param]
             
-            # Reduce learning rate to improve stability
+            # Adjust learning rate for parallel training
             if 'learning_rate' in trainer_init_args:
                 original_lr = trainer_init_args['learning_rate']
-                trainer_init_args['learning_rate'] = original_lr * 0.5  # Reduce learning rate by half
-                print(f"Reducing learning rate from {original_lr} to {trainer_init_args['learning_rate']} for stability")
+                # Scale learning rate based on number of workers
+                trainer_init_args['learning_rate'] = original_lr * np.sqrt(num_gpus)
+                print(f"Scaling learning rate from {original_lr} to {trainer_init_args['learning_rate']} for {num_gpus} workers")
             
             print(f"Creating trainer on device {device} with batch_size={trainer_init_args['batch_size']}")
             
@@ -146,7 +182,7 @@ class ParallelPPOTrainer:
                 'num_iterations': trainer_args.get('num_iterations', 1000),
                 'steps_per_iteration': trainer_args.get('steps_per_iteration', 128),
                 'save_interval': trainer_args.get('save_interval', 50),
-                'save_dir': trainer_args.get('save_dir', 'models')
+                'save_dir': trainer_args.get('save_dir', 'trained_models')
             }
 
             print(f"Worker on GPU {gpu_id} training with: iterations={training_args['num_iterations']}, steps={training_args['steps_per_iteration']}")
@@ -161,6 +197,228 @@ class ParallelPPOTrainer:
                     print(f"Error initializing GradScaler: {e}")
                     use_mixed_precision = False
                     print("Mixed precision disabled due to errors")
+            
+            # Model synchronization functions
+            def sync_models_with_shared():
+                """Synchronize model parameters with shared models"""
+                if shared_models is not None:
+                    try:
+                        for pod_key, network in trainer.pod_networks.items():
+                            if pod_key in shared_models and len(shared_models[pod_key]) > 0:
+                                # Load shared parameters
+                                shared_state = dict(shared_models[pod_key])
+                                current_state = network.state_dict()
+                                
+                                # Weighted average: favor shared knowledge but keep some local adaptation
+                                alpha = 0.8  # Weight for shared parameters
+                                for param_name in current_state:
+                                    if param_name in shared_state:
+                                        shared_param = shared_state[param_name].to(device)
+                                        current_state[param_name] = (
+                                            alpha * shared_param + 
+                                            (1 - alpha) * current_state[param_name]
+                                        )
+                                
+                                network.load_state_dict(current_state)
+                                print(f"GPU {gpu_id} - Synchronized {pod_key} parameters")
+                    except Exception as e:
+                        print(f"GPU {gpu_id} - Error synchronizing models: {e}")
+            
+            def update_shared_models():
+                """Update shared model parameters with local improvements"""
+                if shared_models is not None:
+                    try:
+                        for pod_key, network in trainer.pod_networks.items():
+                            if pod_key not in shared_models:
+                                shared_models[pod_key] = {}
+                            
+                            # Update shared parameters with local state
+                            local_state = network.state_dict()
+                            for param_name, param_value in local_state.items():
+                                shared_models[pod_key][param_name] = param_value.cpu()
+                            
+                            print(f"GPU {gpu_id} - Updated shared {pod_key} parameters")
+                    except Exception as e:
+                        print(f"GPU {gpu_id} - Error updating shared models: {e}")
+            
+            def aggregate_gradients():
+                """Aggregate gradients across workers"""
+                if gradient_aggregation and shared_metrics is not None:
+                    try:
+                        # Store gradients in shared metrics for aggregation
+                        gradient_key = f"gradients_gpu_{gpu_id}"
+                        shared_metrics[gradient_key] = {}
+                        
+                        for pod_key, network in trainer.pod_networks.items():
+                            shared_metrics[gradient_key][pod_key] = {}
+                            for name, param in network.named_parameters():
+                                if param.grad is not None:
+                                    shared_metrics[gradient_key][pod_key][name] = param.grad.cpu()
+                        
+                        # Wait for other workers and average gradients
+                        time.sleep(0.2)  # Increased delay to ensure all workers update
+                        
+                        # Check if we have gradients from all workers
+                        gradient_keys = [k for k in shared_metrics.keys() if k.startswith("gradients_gpu_")]
+                        if len(gradient_keys) >= num_gpus:
+                            # Average gradients
+                            for pod_key, network in trainer.pod_networks.items():
+                                for name, param in network.named_parameters():
+                                    if param.grad is not None:
+                                        grad_sum = torch.zeros_like(param.grad)
+                                        count = 0
+                                        
+                                        for grad_key in gradient_keys:
+                                            # Add safety checks for nested dictionary access
+                                            if (grad_key in shared_metrics and 
+                                                isinstance(shared_metrics[grad_key], dict) and
+                                                pod_key in shared_metrics[grad_key] and 
+                                                isinstance(shared_metrics[grad_key][pod_key], dict) and
+                                                name in shared_metrics[grad_key][pod_key]):
+                                                try:
+                                                    grad_tensor = shared_metrics[grad_key][pod_key][name].to(device)
+                                                    grad_sum += grad_tensor
+                                                    count += 1
+                                                except Exception as tensor_error:
+                                                    print(f"GPU {gpu_id} - Error loading gradient tensor for {pod_key}.{name}: {tensor_error}")
+                                                    continue
+                                        
+                                        if count > 0:
+                                            param.grad = grad_sum / count
+                            
+                            # Clear gradient storage with safety checks
+                            gradient_keys_to_remove = []
+                            for grad_key in gradient_keys:
+                                if grad_key in shared_metrics:
+                                    gradient_keys_to_remove.append(grad_key)
+                            
+                            for grad_key in gradient_keys_to_remove:
+                                try:
+                                    del shared_metrics[grad_key]
+                                except KeyError:
+                                    # Key might have been deleted by another worker
+                                    pass
+                    
+                    except Exception as e:
+                        print(f"GPU {gpu_id} - Error aggregating gradients: {e}")
+                        # Print more detailed error information
+                        import traceback
+                        print(f"GPU {gpu_id} - Gradient aggregation traceback: {traceback.format_exc()}")
+                        
+                        # Print available keys for debugging
+                        try:
+                            available_keys = list(shared_metrics.keys()) if shared_metrics else []
+                            gradient_keys = [k for k in available_keys if k.startswith("gradients_gpu_")]
+                            print(f"GPU {gpu_id} - Available gradient keys: {gradient_keys}")
+                            print(f"GPU {gpu_id} - Available pod keys in trainer: {list(trainer.pod_networks.keys())}")
+                        except Exception as debug_error:
+                            print(f"GPU {gpu_id} - Error in debug output: {debug_error}")
+            
+            def coordinate_learning_rates(avg_reward):
+                """Coordinate learning rates based on global performance"""
+                if adaptive_lr and shared_metrics is not None:
+                    try:
+                        # Update global metrics
+                        shared_metrics[f'gpu_{gpu_id}_reward'] = avg_reward
+                        
+                        # Calculate global average reward
+                        total_reward = 0
+                        worker_count = 0
+                        for i in range(num_gpus):
+                            reward_key = f'gpu_{i}_reward'
+                            if reward_key in shared_metrics:
+                                total_reward += shared_metrics[reward_key]
+                                worker_count += 1
+                        
+                        if worker_count > 0:
+                            global_avg_reward = total_reward / worker_count
+                            
+                            # Adjust learning rate based on global performance
+                            best_reward = shared_metrics.get('best_global_reward', float('-inf'))
+                            if global_avg_reward > best_reward:
+                                # Performance improving, maintain or slightly increase LR
+                                lr_multiplier = 1.02
+                                shared_metrics['best_global_reward'] = global_avg_reward
+                                shared_metrics['stagnation_count'] = 0
+                            else:
+                                # Performance stagnating, track and potentially reduce LR
+                                stagnation = shared_metrics.get('stagnation_count', 0) + 1
+                                shared_metrics['stagnation_count'] = stagnation
+                                
+                                if stagnation > 5:  # Reduce LR after 5 iterations of stagnation
+                                    lr_multiplier = 0.95
+                                    shared_metrics['stagnation_count'] = 0  # Reset counter
+                                else:
+                                    lr_multiplier = 1.0  # Keep current LR
+                            
+                            # Update learning rates
+                            for pod_key, optimizer in trainer.optimizers.items():
+                                for param_group in optimizer.param_groups:
+                                    old_lr = param_group['lr']
+                                    param_group['lr'] *= lr_multiplier
+                                    if lr_multiplier != 1.0:
+                                        print(f"GPU {gpu_id} - Updated LR for {pod_key}: {old_lr:.6f} -> {param_group['lr']:.6f}")
+                                        
+                    except Exception as e:
+                        print(f"GPU {gpu_id} - Error coordinating learning rates: {e}")
+            
+            def add_experience_to_shared_buffer(observations, actions, rewards, values, log_probs, dones):
+                """Add experience to shared buffer for cross-worker learning"""
+                if shared_experience is not None:
+                    try:
+                        for pod_key in trainer.pod_networks.keys():
+                            if pod_key in observations:
+                                experience = {
+                                    'pod_key': pod_key,
+                                    'observation': observations[pod_key].cpu(),
+                                    'action': actions[pod_key].cpu(),
+                                    'reward': rewards[pod_key].cpu(),
+                                    'value': values[pod_key].cpu(),
+                                    'log_prob': log_probs[pod_key].cpu(),
+                                    'done': dones[pod_key].cpu() if isinstance(dones, dict) else dones.cpu(),
+                                    'worker_id': gpu_id
+                                }
+                                shared_experience.add_experience(experience)
+                    except Exception as e:
+                        print(f"GPU {gpu_id} - Error adding experience to shared buffer: {e}")
+            
+            def sample_shared_experiences():
+                """Sample experiences from shared buffer to augment local training"""
+                if shared_experience is not None:
+                    try:
+                        shared_experiences = shared_experience.sample_experiences(batch_size=32)
+                        if len(shared_experiences) > 0:
+                            # Organize experiences by pod_key
+                            shared_data = {}
+                            for exp in shared_experiences:
+                                pod_key = exp['pod_key']
+                                if pod_key not in shared_data:
+                                    shared_data[pod_key] = {
+                                        'observations': [],
+                                        'actions': [],
+                                        'rewards': [],
+                                        'values': [],
+                                        'log_probs': [],
+                                        'dones': []
+                                    }
+                                
+                                shared_data[pod_key]['observations'].append(exp['observation'].to(device))
+                                shared_data[pod_key]['actions'].append(exp['action'].to(device))
+                                shared_data[pod_key]['rewards'].append(exp['reward'].to(device))
+                                shared_data[pod_key]['values'].append(exp['value'].to(device))
+                                shared_data[pod_key]['log_probs'].append(exp['log_prob'].to(device))
+                                shared_data[pod_key]['dones'].append(exp['done'].to(device))
+                            
+                            # Add shared experiences to local storage
+                            for pod_key, data in shared_data.items():
+                                if pod_key in trainer.storage:
+                                    for key, values in data.items():
+                                        trainer.storage[pod_key][key].extend(values)
+                            
+                            print(f"GPU {gpu_id} - Added {len(shared_experiences)} shared experiences to training")
+                            
+                    except Exception as e:
+                        print(f"GPU {gpu_id} - Error sampling shared experiences: {e}")
             
             # Add gradient clipping to prevent NaN values
             original_update_pod = trainer._update_pod
@@ -237,6 +495,9 @@ class ParallelPPOTrainer:
                             if torch.isnan(rewards[pod_key]).any():
                                 print(f"NaN detected in rewards for {pod_key}. Replacing with zeros.")
                                 rewards[pod_key] = torch.zeros_like(rewards[pod_key])
+                        
+                        # Add experience to shared buffer
+                        add_experience_to_shared_buffer(observations, actions, rewards, values, log_probs, dones)
                         
                         # Update pod trails for visualization
                         if vis_queue is not None and not hasattr(trainer, 'pod_trails'):
@@ -379,7 +640,10 @@ class ParallelPPOTrainer:
                         
                         # Ensure synchronization between operations
                         if device.type == 'cuda':
-                            torch.cuda.synchronize(device)       
+                            torch.cuda.synchronize(device)
+                
+                # Sample shared experiences to augment training data
+                sample_shared_experiences()
 
             # Replace the trainer's collect_trajectories method
             trainer.collect_trajectories = parallel_collect_trajectories
@@ -438,7 +702,7 @@ class ParallelPPOTrainer:
             # Replace the trainer's compute_returns_and_advantages method
             trainer.compute_returns_and_advantages = compute_returns_with_nan_check
 
-            # Override update_policy to return loss values and handle NaN
+            # Override update_policy to return loss values and handle NaN with gradient aggregation
             original_update_policy = trainer.update_policy
 
             def update_policy_with_losses_and_nan_check():
@@ -470,6 +734,9 @@ class ParallelPPOTrainer:
                         print(f"Error updating policy for {pod_key}: {e}")
                         print(traceback.format_exc())
                         # Continue with other pods
+                
+                # Aggregate gradients across workers before optimizer step
+                aggregate_gradients()
                 
                 # Calculate average losses
                 avg_policy_loss = total_policy_loss / max(1, pod_count)
@@ -506,17 +773,27 @@ class ParallelPPOTrainer:
             # Check networks before starting training
             check_and_fix_network_parameters()
 
+            # Initialize shared models if this is the first worker
+            if shared_models is not None and gpu_id == 0:
+                print(f"GPU {gpu_id} - Initializing shared model parameters")
+                update_shared_models()
+
             for iteration in range(1, training_args['num_iterations'] + 1):
                 start_time = time.time()
+                
+                # Synchronize models periodically
+                if iteration % sync_interval == 0 and iteration > 1 and shared_models is not None:
+                    sync_models_with_shared()
                 
                 # Adjust learning rate based on iteration (simple linear decay)
                 progress = iteration / training_args['num_iterations']
                 current_lr = max(min_lr, initial_lr * (1 - 0.9 * progress))  # Linear decay to 10% of initial
                 
-                # Update learning rate in optimizer
+                # Update learning rate in optimizer (will be further adjusted by coordinate_learning_rates)
+                base_lr = current_lr
                 for pod_key, optimizer in trainer.optimizers.items():
                     for param_group in optimizer.param_groups:
-                        param_group['lr'] = current_lr
+                        param_group['lr'] = base_lr
                 
                 try:
                     # Collect trajectories
@@ -530,6 +807,10 @@ class ParallelPPOTrainer:
                     
                     # Check for NaN in network parameters after update
                     check_and_fix_network_parameters()
+                    
+                    # Update shared models after successful training step
+                    if iteration % sync_interval == 0 and shared_models is not None:
+                        update_shared_models()
                     
                     # Calculate elapsed time since start of iteration
                     elapsed_time = time.time() - start_time
@@ -556,6 +837,12 @@ class ParallelPPOTrainer:
                     avg_runner_reward = runner_reward / max(1, runner_count)
                     avg_blocker_reward = blocker_reward / max(1, blocker_count)
                     avg_total_reward = (runner_reward + blocker_reward) / max(1, runner_count + blocker_count)
+
+                    # Coordinate learning rates based on performance
+                    coordinate_learning_rates(avg_total_reward)
+                    
+                    # Get current learning rate after coordination
+                    current_lr = trainer.optimizers[next(iter(trainer.optimizers))].param_groups[0]['lr']
 
                     # Log progress with role-specific information
                     print(f"GPU {gpu_id} - Iteration {iteration}/{training_args['num_iterations']} completed in {elapsed_time:.2f}s")
@@ -597,11 +884,23 @@ class ParallelPPOTrainer:
                                     break
                             
                             if not has_nan:
-                                # Save with GPU ID in filename to avoid conflicts
-                                torch.save(network.state_dict(), save_dir / f"{pod_key}_gpu{gpu_id}_iter{iteration}.pt")
+                                # Extract player and pod indices from pod_key
+                                # pod_key format: "player{player_idx}_pod{team_pod_idx}"
+                                parts = pod_key.split('_')
+                                player_idx = parts[0].replace('player', '')
+                                team_pod_idx = int(parts[1].replace('pod', ''))
+                                
+                                # Determine role based on team_pod_idx
+                                role = "runner" if team_pod_idx == 0 else "blocker"
+                                
+                                # Create descriptive filename with role
+                                base_filename = f"player{player_idx}_{role}_gpu{gpu_id}"
+                                
+                                # Save with iteration number
+                                torch.save(network.state_dict(), save_dir / f"{base_filename}_iter{iteration}.pt")
                                 # Also save as the latest model
-                                torch.save(network.state_dict(), save_dir / f"{pod_key}_gpu{gpu_id}.pt")
-                                print(f"GPU {gpu_id} - Models saved at iteration {iteration}")
+                                torch.save(network.state_dict(), save_dir / f"{base_filename}.pt")
+                                print(f"GPU {gpu_id} - Models saved at iteration {iteration} as {base_filename}")
                             else:
                                 print(f"GPU {gpu_id} - Not saving model for {pod_key} due to NaN parameters")
                     
@@ -630,7 +929,16 @@ class ParallelPPOTrainer:
             # Store results in shared dictionary
             shared_results[f'gpu_{gpu_id}'] = {
                 'completed': True,
-                'env_indices': env_indices
+                'env_indices': env_indices,
+                'final_rewards': {
+                    'total': avg_total_reward,
+                    'runner': avg_runner_reward,
+                    'blocker': avg_blocker_reward
+                },
+                'final_losses': {
+                    'policy': policy_loss,
+                    'value': value_loss
+                }
             }
 
         except Exception as e:
@@ -643,9 +951,15 @@ class ParallelPPOTrainer:
             }
 
     def train(self, visualization_panel=None):
-        """Start parallel training across GPUs with improved error handling"""
-        print("Starting parallel training...")
+        """Start parallel training across GPUs with improved error handling and model synchronization"""
+        print("Starting parallel training with model synchronization...")
         print(f"Training parameters: num_iterations={self.trainer_args.get('num_iterations')}, steps_per_iteration={self.trainer_args.get('steps_per_iteration')}")
+        print(f"Synchronization settings:")
+        print(f"  - Sync interval: {self.sync_interval}")
+        print(f"  - Parameter server: {self.use_parameter_server}")
+        print(f"  - Shared experience: {self.shared_experience_buffer}")
+        print(f"  - Gradient aggregation: {self.gradient_aggregation}")
+        print(f"  - Adaptive learning rate: {self.adaptive_lr}")
         
         # Create environment indices for each GPU
         all_env_indices = np.arange(self.total_envs).reshape(self.num_gpus, self.envs_per_gpu)
@@ -653,6 +967,30 @@ class ParallelPPOTrainer:
         # Create a manager for sharing results between processes
         manager = mp.Manager()
         shared_results = manager.dict()
+
+        # Create shared model storage if using parameter server
+        shared_models = None
+        if self.use_parameter_server and self.num_gpus > 1:
+            print("Setting up shared model parameters...")
+            shared_models = manager.dict()
+            
+            # Initialize shared model parameters - will be populated by first worker
+            pod_keys = ['player0_pod0', 'player0_pod1']  # Adjust based on your setup
+            for pod_key in pod_keys:
+                shared_models[pod_key] = manager.dict()
+            print(f"Initialized shared models for keys: {pod_keys}")
+
+        # Create shared experience buffer if enabled
+        shared_experience = None
+        if self.shared_experience_buffer:
+            print("Setting up shared experience buffer...")
+            shared_experience = SharedExperienceBuffer(manager, buffer_size=20000)
+            print("Shared experience buffer initialized")
+
+        # Create shared metrics for coordination
+        shared_metrics = manager.dict()
+        shared_metrics['best_global_reward'] = float('-inf')
+        shared_metrics['stagnation_count'] = 0
 
         # Create a shared queue for visualization if needed
         vis_queue = None
@@ -674,7 +1012,7 @@ class ParallelPPOTrainer:
             env_indices = all_env_indices[i].tolist()
             print(f"Starting worker process for GPU {gpu_id} with env indices {env_indices}")
             
-            # Pass only serializable data to the worker process
+            # Pass all necessary data to the worker process
             p = mp.Process(
                 target=self._worker,
                 args=(
@@ -686,17 +1024,57 @@ class ParallelPPOTrainer:
                     self.envs_per_gpu,           # Environments per GPU
                     self.use_mixed_precision,    # Whether to use mixed precision
                     shared_results,              # Shared results dictionary
-                    vis_queue                    # Shared queue for visualization
+                    vis_queue,                   # Shared queue for visualization
+                    shared_models,               # Shared model parameters
+                    shared_experience,           # Shared experience buffer
+                    shared_metrics,              # Shared metrics for coordination
+                    self.sync_interval,          # Model synchronization interval
+                    self.gradient_aggregation,   # Whether to aggregate gradients
+                    self.adaptive_lr,            # Whether to use adaptive learning rate
+                    self.num_gpus                # Number of GPUs for coordination
                 )
             )
             self.processes.append(p)
             p.start()
 
+        # Monitor training progress
+        print("Monitoring parallel training progress...")
+        start_time = time.time()
+        last_sync_report = time.time()
+        
         # Wait for all processes to finish
         try:
             # Monitor processes and periodically check if they're alive
             while any(p.is_alive() for p in self.processes):
-                time.sleep(1.0)
+                time.sleep(2.0)
+                
+                # Report synchronization status periodically
+                current_time = time.time()
+                if current_time - last_sync_report > 30:  # Report every 30 seconds
+                    alive_workers = sum(1 for p in self.processes if p.is_alive())
+                    elapsed_minutes = (current_time - start_time) / 60
+                    
+                    print(f"Training status after {elapsed_minutes:.1f} minutes:")
+                    print(f"  - Active workers: {alive_workers}/{len(self.processes)}")
+                    
+                    # Report shared metrics if available
+                    if shared_metrics:
+                        best_reward = shared_metrics.get('best_global_reward', 'N/A')
+                        stagnation = shared_metrics.get('stagnation_count', 'N/A')
+                        print(f"  - Best global reward: {best_reward}")
+                        print(f"  - Stagnation count: {stagnation}")
+                        
+                        # Report individual worker rewards
+                        worker_rewards = []
+                        for i in range(self.num_gpus):
+                            reward_key = f'gpu_{i}_reward'
+                            if reward_key in shared_metrics:
+                                worker_rewards.append(f"GPU{i}: {shared_metrics[reward_key]:.4f}")
+                        
+                        if worker_rewards:
+                            print(f"  - Worker rewards: {', '.join(worker_rewards)}")
+                    
+                    last_sync_report = current_time
                 
                 # Check for early termination due to errors
                 for key, result in shared_results.items():
@@ -711,8 +1089,13 @@ class ParallelPPOTrainer:
                     p.terminate()
         finally:
             # Wait for processes to finish
-            for p in self.processes:
-                p.join(timeout=5.0)
+            print("Waiting for all processes to complete...")
+            for i, p in enumerate(self.processes):
+                p.join(timeout=10.0)
+                if p.is_alive():
+                    print(f"Process {i} did not terminate gracefully, forcing termination...")
+                    p.terminate()
+                    p.join(timeout=5.0)
             
             # Stop visualization connector if it was started
             if vis_connector:
@@ -720,6 +1103,9 @@ class ParallelPPOTrainer:
                 vis_connector.stop()
         
         print("All worker processes completed")
+        
+        # Report final results
+        self._report_training_results(shared_results)
         
         # Check for errors in any of the processes
         errors = []
@@ -735,6 +1121,54 @@ class ParallelPPOTrainer:
         print("Parallel training completed successfully")
         return True
 
+    def _report_training_results(self, shared_results):
+        """Report final training results from all workers"""
+        print("\n" + "="*60)
+        print("PARALLEL TRAINING RESULTS")
+        print("="*60)
+        
+        total_rewards = []
+        runner_rewards = []
+        blocker_rewards = []
+        policy_losses = []
+        value_losses = []
+        
+        for key, result in shared_results.items():
+            if result.get('completed', False):
+                gpu_id = key.replace('gpu_', '')
+                final_rewards = result.get('final_rewards', {})
+                final_losses = result.get('final_losses', {})
+                
+                print(f"\nGPU {gpu_id} Results:")
+                print(f"  Total Reward: {final_rewards.get('total', 'N/A'):.4f}")
+                print(f"  Runner Reward: {final_rewards.get('runner', 'N/A'):.4f}")
+                print(f"  Blocker Reward: {final_rewards.get('blocker', 'N/A'):.4f}")
+                print(f"  Policy Loss: {final_losses.get('policy', 'N/A'):.4f}")
+                print(f"  Value Loss: {final_losses.get('value', 'N/A'):.4f}")
+                
+                # Collect for averaging
+                if 'total' in final_rewards:
+                    total_rewards.append(final_rewards['total'])
+                if 'runner' in final_rewards:
+                    runner_rewards.append(final_rewards['runner'])
+                if 'blocker' in final_rewards:
+                    blocker_rewards.append(final_rewards['blocker'])
+                if 'policy' in final_losses:
+                    policy_losses.append(final_losses['policy'])
+                if 'value' in final_losses:
+                    value_losses.append(final_losses['value'])
+        
+        # Calculate and report averages
+        if total_rewards:
+            print(f"\nAVERAGE ACROSS ALL WORKERS:")
+            print(f"  Average Total Reward: {np.mean(total_rewards):.4f} ± {np.std(total_rewards):.4f}")
+            print(f"  Average Runner Reward: {np.mean(runner_rewards):.4f} ± {np.std(runner_rewards):.4f}")
+            print(f"  Average Blocker Reward: {np.mean(blocker_rewards):.4f} ± {np.std(blocker_rewards):.4f}")
+            print(f"  Average Policy Loss: {np.mean(policy_losses):.4f} ± {np.std(policy_losses):.4f}")
+            print(f"  Average Value Loss: {np.mean(value_losses):.4f} ± {np.std(value_losses):.4f}")
+        
+        print("="*60)
+
     def _process_visualization_data(self, vis_queue, visualization_panel):
         """Process visualization data from the queue and send to the visualization panel"""
         try:
@@ -746,7 +1180,7 @@ class ParallelPPOTrainer:
                     
                     # Debug print to verify data is being received
                     if 'iteration' in data:
-                        print(f"Received metric data: iteration={data['iteration']}, reward={data.get('reward', 0):.4f}")
+                        print(f"Received metric data: iteration={data['iteration']}, reward={data.get('total_reward', 0):.4f}")
                     elif 'race_state' in data:
                         print(f"Received race state data with {len(data['race_state'].get('pods', []))} pods")
                     

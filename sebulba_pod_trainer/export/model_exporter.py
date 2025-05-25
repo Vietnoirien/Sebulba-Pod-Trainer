@@ -208,88 +208,122 @@ class ModelExporter:
                 print(f"Failed to load model even with adaptation: {e2}")
                 raise e2
     
+    def _find_best_model_file_for_role(self, role):
+        """Find the best model file for a specific role (runner or blocker)"""
+        # Look for role-based files first (new naming convention)
+        role_files = list(self.model_path.glob(f"player*_{role}*.pt"))
+        
+        # Fallback to legacy pod-based naming if no role-based files found
+        if not role_files:
+            if role == "runner":
+                role_files = list(self.model_path.glob("player*_pod0*.pt"))
+            elif role == "blocker":
+                role_files = list(self.model_path.glob("player*_pod1*.pt"))
+        
+        if not role_files:
+            return None
+        
+        # First try standard filename (usually the final/best model)
+        standard_files = [f for f in role_files if '_gpu' not in f.name and '_iter' not in f.name]
+        if standard_files:
+            return standard_files[0]
+        
+        # Next try latest model
+        latest_files = [f for f in role_files if '_latest' in f.name]
+        if latest_files:
+            return latest_files[0]
+        
+        # Try GPU-specific filename without iteration (latest)
+        gpu_files = [f for f in role_files if '_gpu' in f.name and '_iter' not in f.name]
+        if gpu_files:
+            return gpu_files[0]
+        
+        # Try GPU-specific filename with iteration (get latest iteration)
+        iter_files = [f for f in role_files if '_iter' in f.name]
+        if iter_files:
+            # Sort by iteration number to get the latest
+            iter_files_with_numbers = []
+            for file in iter_files:
+                try:
+                    iter_num = int(str(file).split('_iter')[-1].split('.')[0])
+                    iter_files_with_numbers.append((iter_num, file))
+                except (ValueError, IndexError):
+                    continue
+            
+            if iter_files_with_numbers:
+                iter_files_with_numbers.sort(key=lambda x: x[0], reverse=True)
+                return iter_files_with_numbers[0][1]
+        
+        # Final fallback: return the first file
+        return role_files[0]
+    
     def _load_default_models(self):
-        """Load default models using auto-discovery with improved error handling"""
-        # Find the best model files
-        runner_path = self._find_best_model_file("player0_pod0")
-        if runner_path is None:
-            runner_path = self._find_best_model_file("pod0")
+        """Load default models using role-based auto-discovery"""
+        # Find the best model files for each role
+        runner_path = self._find_best_model_file_for_role("runner")
         
         if runner_path is not None:
             runner_config = self._infer_network_config(runner_path)
             self.runner_model = self._load_model_with_config(runner_path, runner_config)
             self.network_config = runner_config  # Store for reference
+            print(f"Loaded runner model: {runner_path}")
         else:
             raise FileNotFoundError(f"Runner model not found in {self.model_path}")
         
         # Load blocker pod model if available
-        blocker_path = self._find_best_model_file("player0_pod1")
-        if blocker_path is None:
-            blocker_path = self._find_best_model_file("pod1")
+        blocker_path = self._find_best_model_file_for_role("blocker")
         
         if blocker_path is not None:
             blocker_config = self._infer_network_config(blocker_path)
             self.blocker_model = self._load_model_with_config(blocker_path, blocker_config)
+            print(f"Loaded blocker model: {blocker_path}")
         else:
-            print(f"Blocker model not found in {self.model_path}, using runner model for both pods")
+            print(f"Blocker model not found in {self.model_path}, using runner model for both roles")
             self.blocker_model = self.runner_model
     
     def set_model_files(self, model_files):
-        """Set specific model files to use instead of auto-discovery"""
+        """
+        Set specific model files to use instead of auto-discovery
         
-        if 'player0_pod0' in model_files:
+        Args:
+            model_files: Dict with keys 'runner' and 'blocker' or legacy 'player0_pod0' and 'player0_pod1'
+        """
+        # Handle both new role-based and legacy pod-based keys
+        runner_path = None
+        blocker_path = None
+        
+        # Check for new role-based keys first
+        if 'runner' in model_files:
+            runner_path = Path(model_files['runner'])
+        elif 'player0_pod0' in model_files:
             runner_path = Path(model_files['player0_pod0'])
+        
+        if 'blocker' in model_files:
+            blocker_path = Path(model_files['blocker'])
+        elif 'player0_pod1' in model_files:
+            blocker_path = Path(model_files['player0_pod1'])
+        
+        # Load runner model
+        if runner_path and runner_path.exists():
             runner_config = self._infer_network_config(runner_path)
             self.runner_model = self._load_model_with_config(runner_path, runner_config)
+            self.network_config = runner_config  # Store for reference
             print(f"Set runner model to {runner_path}")
         
-        if 'player0_pod1' in model_files:
-            blocker_path = Path(model_files['player0_pod1'])
+        # Load blocker model
+        if blocker_path and blocker_path.exists():
             blocker_config = self._infer_network_config(blocker_path)
             self.blocker_model = self._load_model_with_config(blocker_path, blocker_config)
             print(f"Set blocker model to {blocker_path}")
         
-        # If only one model was specified, use it for both pods if the other wasn't loaded
+        # If only one model was specified, use it for both roles if the other wasn't loaded
         if len(model_files) == 1:
-            if 'player0_pod0' in model_files and self.blocker_model is None:
-                print("Using runner model for blocker pod as well")
+            if runner_path and self.blocker_model is None:
+                print("Using runner model for blocker role as well")
                 self.blocker_model = self.runner_model
-            elif 'player0_pod1' in model_files and self.runner_model is None:
-                print("Using blocker model for runner pod as well")
+            elif blocker_path and self.runner_model is None:
+                print("Using blocker model for runner role as well")
                 self.runner_model = self.blocker_model
-      
-    def _find_best_model_file(self, pod_name):
-        """Find the best model file for a pod using various naming patterns"""
-        # First try standard filename
-        standard_file = self.model_path / f"{pod_name}.pt"
-        if standard_file.exists():
-            return standard_file
-            
-        # Next try latest model
-        latest_file = self.model_path / f"{pod_name}_latest.pt"
-        if latest_file.exists():
-            return latest_file
-            
-        # Try GPU-specific filename without iteration (latest)
-        gpu_files = list(self.model_path.glob(f"{pod_name}_gpu*.pt"))
-        if gpu_files:
-            return gpu_files[0]  # Use the first one found
-            
-        # Try GPU-specific filename with iteration
-        iter_files = list(self.model_path.glob(f"{pod_name}_gpu*_iter*.pt"))
-        if iter_files:
-            # Sort by iteration number to get the latest
-            iter_files.sort(key=lambda x: int(str(x).split('_iter')[-1].split('.')[0]), reverse=True)
-            return iter_files[0]
-            
-        # Try iteration-specific files
-        iter_files = list(self.model_path.glob(f"{pod_name}_iter*.pt"))
-        if iter_files:
-            # Sort by iteration number to get the latest
-            iter_files.sort(key=lambda x: int(str(x).split('_iter')[-1].split('.')[0]), reverse=True)
-            return iter_files[0]
-            
-        return None
     
     def _extract_weights(self, model, quantize=True, precision=3):
         """
@@ -332,66 +366,6 @@ class ModelExporter:
                 # Recursively compress nested lists
                 return [self._compress_weights(x, precision) for x in weights_list]
         return weights_list
-    
-    def _encode_weights_efficiently(self, weights, precision=3):
-        """
-        Encode weights more efficiently to reduce file size
-        
-        Args:
-            weights: Dictionary of weight tensors
-            precision: Number of decimal places to keep
-        """
-        encoded_weights = {}
-        
-        for name, param in weights.items():
-            if isinstance(param, list):
-                # Determine if we can use a more efficient encoding
-                if len(param) > 0 and isinstance(param[0], list):
-                    # For 2D arrays (matrices)
-                    flattened = []
-                    shape = [len(param), len(param[0])]
-                    
-                    for row in param:
-                        flattened.extend(row)
-                    
-                    # Quantize the flattened array
-                    quantized = [round(x * 10**precision) / 10**precision for x in flattened]
-                    
-                    encoded_weights[name] = {
-                        'shape': shape,
-                        'data': quantized
-                    }
-                else:
-                    # For 1D arrays (vectors)
-                    encoded_weights[name] = [round(x * 10**precision) / 10**precision for x in param]
-        
-        return encoded_weights
-    
-    def _generate_layer_code(self, layer_name, weights, biases, precision=3):
-        """Generate Python code for a linear layer with compressed weights"""
-        code = []
-        
-        # Compress weights and biases
-        compressed_weights = self._compress_weights(weights, precision)
-        compressed_biases = self._compress_weights(biases, precision)
-        
-        # Format weights and biases as Python lists
-        weights_str = json.dumps(compressed_weights)
-        biases_str = json.dumps(compressed_biases)
-        
-        # Generate function for this layer
-        code.append(f"def {layer_name}(x):")
-        code.append(f"    weights = {weights_str}")
-        code.append(f"    biases = {biases_str}")
-        code.append("    result = [0.0] * len(biases)")
-        code.append("    for i in range(len(result)):")
-        code.append("        for j in range(len(x)):")
-        code.append("            result[i] += x[j] * weights[i][j]")
-        code.append("        result[i] += biases[i]")
-        code.append("    return result")
-        code.append("")
-        
-        return code
     
     def _generate_efficient_layer_code(self, layer_name, weights, biases, precision=3):
         """Generate Python code for a linear layer with efficiently encoded weights"""
@@ -554,7 +528,7 @@ class ModelExporter:
         code.append("    obs = []")
         code.append("")
         
-        # Base observations (48 dimensions) - same as before
+        # Base observations (48 dimensions)
         code.append("    # === BASE OBSERVATIONS (48 dimensions) ===")
         code.append("    # 1-2: Normalized position")
         code.append("    norm_x = (x * 2.0 / WIDTH) - 1.0")
@@ -697,7 +671,8 @@ class ModelExporter:
         code.append("        # 10: Opponent's boost availability (assume available)")
         code.append("        obs.append(1.0)")
         code.append("")
-        # NEW: Role-specific observations (8 dimensions)
+        
+        # Role-specific observations (8 dimensions)
         code.append("    # === ROLE-SPECIFIC OBSERVATIONS (8 dimensions) ===")
         code.append("    # Role identifier")
         code.append("    role_id = float(pod_id)  # 0 for runner (pod0), 1 for blocker (pod1)")
@@ -828,11 +803,11 @@ class ModelExporter:
         code.append("        )")
         code.append("")
 
-        # Get model predictions
-        code.append("        # Get model predictions")
-        code.append("        if pod_id == 0:")
+        # Get model predictions based on role
+        code.append("        # Get model predictions based on role")
+        code.append("        if pod_id == 0:  # Runner")
         code.append("            angle_output, thrust, shield_prob, boost_prob = runner_forward(obs)")
-        code.append("        else:")
+        code.append("        else:  # Blocker")
         code.append("            angle_output, thrust, shield_prob, boost_prob = blocker_forward(obs)")
         code.append("")
         
@@ -957,6 +932,6 @@ class ModelExporter:
             'file_size_kb': file_size_kb,
             'quantized': quantize,
             'precision': precision,
-            'runner_config': self._infer_network_config(self._find_best_model_file("player0_pod0")) if hasattr(self, 'runner_model') else None,
-            'blocker_config': self._infer_network_config(self._find_best_model_file("player0_pod1")) if hasattr(self, 'blocker_model') else None
+            'runner_model_path': self._find_best_model_file_for_role("runner"),
+            'blocker_model_path': self._find_best_model_file_for_role("blocker")
         }
