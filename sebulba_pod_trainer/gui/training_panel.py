@@ -331,9 +331,12 @@ class TrainingPanel(wx.Panel):
         dlg.Destroy()
     
     def on_train(self, event):
-        """Start training"""
+        """Start training with enhanced monitoring"""
         # Update configuration from UI
         self.update_config()
+        
+        # Add reward monitoring flag
+        self.main_frame.config['monitor_rewards'] = True
         
         # Start training
         self.main_frame.on_start_training(event)

@@ -68,7 +68,10 @@ class ParallelPPOTrainer:
         self.gradient_aggregation = self.trainer_args.get('gradient_aggregation', True)
         self.adaptive_lr = self.trainer_args.get('adaptive_lr', True)
 
-        # Print trainer args for debugging
+        # Add timeout penalty configuration
+        if 'timeout_penalty_weight' not in self.env_config:
+            self.env_config['timeout_penalty_weight'] = 0.01  # Default timeout penalty weight
+        
         print(f"ParallelPPOTrainer initialized with args: {self.trainer_args}")
         print(f"Training iterations: {self.trainer_args.get('num_iterations', 'NOT FOUND')}")
         print(f"Steps per iteration: {self.trainer_args.get('steps_per_iteration', 'NOT FOUND')}")
@@ -79,6 +82,7 @@ class ParallelPPOTrainer:
         print(f"Parameter server: {self.use_parameter_server}")
         print(f"Shared experience: {self.shared_experience_buffer}")
         print(f"Gradient aggregation: {self.gradient_aggregation}")
+        print(f"Timeout penalty weight: {self.env_config['timeout_penalty_weight']}")
         
         # Calculate total number of environments
         self.total_envs = self.num_gpus * self.envs_per_gpu
@@ -91,7 +95,7 @@ class ParallelPPOTrainer:
                 gradient_aggregation=True, adaptive_lr=True, num_gpus=1):
         """Enhanced worker process with model synchronization and experience sharing"""
         try:
-            print(f"Worker process for GPU {gpu_id} starting with synchronization...")
+            print(f"Worker process for GPU {gpu_id} starting with timeout penalty prevention...")
             # Set CUDA device for this process
             try:
                 torch.cuda.set_device(gpu_id)
@@ -116,6 +120,7 @@ class ParallelPPOTrainer:
                     
                     print(f"Creating environment {i} on device {device} with config: {env_config_copy}")
                     print(f"Using optimized environment: {use_optimized_env}")
+                    print(f"Timeout penalty weight: {env_config_copy.get('timeout_penalty_weight', 'NOT SET')}")
                     
                     # Choose environment class based on use_optimized_env flag
                     if use_optimized_env:
@@ -186,6 +191,7 @@ class ParallelPPOTrainer:
             }
 
             print(f"Worker on GPU {gpu_id} training with: iterations={training_args['num_iterations']}, steps={training_args['steps_per_iteration']}")
+            print(f"Worker on GPU {gpu_id} timeout penalty enabled - no more timeout exploitation!")
             
             # Initialize mixed precision scaler if enabled
             scaler = None
@@ -200,13 +206,21 @@ class ParallelPPOTrainer:
             
             # Model synchronization functions
             def sync_models_with_shared():
-                """Synchronize model parameters with shared models"""
+                """Synchronize model parameters with shared models by role"""
                 if shared_models is not None:
                     try:
                         for pod_key, network in trainer.pod_networks.items():
-                            if pod_key in shared_models and len(shared_models[pod_key]) > 0:
-                                # Load shared parameters
-                                shared_state = dict(shared_models[pod_key])
+                            # Extract role from pod_key (pod0 = runner, pod1 = blocker)
+                            parts = pod_key.split('_')
+                            team_pod_idx = int(parts[1].replace('pod', ''))
+                            role = "runner" if team_pod_idx == 0 else "blocker"
+                            
+                            # Use role-based key for shared models
+                            role_key = f"{role}_network"
+                            
+                            if role_key in shared_models and len(shared_models[role_key]) > 0:
+                                # Load shared parameters for this role
+                                shared_state = dict(shared_models[role_key])
                                 current_state = network.state_dict()
                                 
                                 # Weighted average: favor shared knowledge but keep some local adaptation
@@ -220,49 +234,61 @@ class ParallelPPOTrainer:
                                         )
                                 
                                 network.load_state_dict(current_state)
-                                print(f"GPU {gpu_id} - Synchronized {pod_key} parameters")
+                                print(f"GPU {gpu_id} - Synchronized {pod_key} ({role}) parameters")
                     except Exception as e:
                         print(f"GPU {gpu_id} - Error synchronizing models: {e}")
-            
+
             def update_shared_models():
-                """Update shared model parameters with local improvements"""
+                """Update shared model parameters with local improvements by role"""
                 if shared_models is not None:
                     try:
                         for pod_key, network in trainer.pod_networks.items():
-                            if pod_key not in shared_models:
-                                shared_models[pod_key] = {}
+                            # Extract role from pod_key
+                            parts = pod_key.split('_')
+                            team_pod_idx = int(parts[1].replace('pod', ''))
+                            role = "runner" if team_pod_idx == 0 else "blocker"
                             
-                            # Update shared parameters with local state
+                            # Use role-based key for shared models
+                            role_key = f"{role}_network"
+                            
+                            if role_key not in shared_models:
+                                shared_models[role_key] = {}
+                            
+                            # Update shared parameters with local state for this role
                             local_state = network.state_dict()
                             for param_name, param_value in local_state.items():
-                                shared_models[pod_key][param_name] = param_value.cpu()
+                                shared_models[role_key][param_name] = param_value.cpu()
                             
-                            print(f"GPU {gpu_id} - Updated shared {pod_key} parameters")
+                            print(f"GPU {gpu_id} - Updated shared {role} parameters from {pod_key}")
                     except Exception as e:
                         print(f"GPU {gpu_id} - Error updating shared models: {e}")
             
             def aggregate_gradients():
-                """Aggregate gradients across workers with robust error handling"""
+                """Aggregate gradients across workers by role"""
                 nonlocal gradient_aggregation
-                
+
                 if not gradient_aggregation or shared_metrics is None:
                     return
                     
                 try:
-                    # Store gradients in shared metrics for aggregation
+                    # Store gradients in shared metrics for aggregation by role
                     gradient_key = f"gradients_gpu_{gpu_id}"
                     
-                    # Create a simple flat dictionary to avoid nested assignment issues
-                    flat_gradients = {}
+                    # Organize gradients by role
+                    role_gradients = {"runner": {}, "blocker": {}}
+                    
                     for pod_key, network in trainer.pod_networks.items():
+                        # Extract role from pod_key
+                        parts = pod_key.split('_')
+                        team_pod_idx = int(parts[1].replace('pod', ''))
+                        role = "runner" if team_pod_idx == 0 else "blocker"
+                        
                         for name, param in network.named_parameters():
                             if param.grad is not None:
-                                # Use a flat key structure: "pod_key::param_name"
-                                flat_key = f"{pod_key}::{name}"
-                                flat_gradients[flat_key] = param.grad.cpu()
+                                role_gradients[role][name] = param.grad.cpu()
                     
-                    # Store the flat structure
-                    shared_metrics[gradient_key] = flat_gradients
+                    # Store the role-organized structure
+                    shared_metrics[gradient_key] = role_gradients
                     
                     # Wait for other workers
                     time.sleep(0.3)
@@ -270,19 +296,22 @@ class ParallelPPOTrainer:
                     # Check if we have gradients from all workers
                     gradient_keys = [k for k in shared_metrics.keys() if k.startswith("gradients_gpu_")]
                     if len(gradient_keys) >= num_gpus:
-                        # Average gradients
+                        # Average gradients by role
                         for pod_key, network in trainer.pod_networks.items():
+                            parts = pod_key.split('_')
+                            team_pod_idx = int(parts[1].replace('pod', ''))
+                            role = "runner" if team_pod_idx == 0 else "blocker"
+                            
                             for name, param in network.named_parameters():
                                 if param.grad is not None:
-                                    flat_key = f"{pod_key}::{name}"
                                     grad_sum = torch.zeros_like(param.grad)
                                     count = 0
                                     
                                     for grad_worker_key in gradient_keys:
                                         try:
                                             worker_gradients = shared_metrics.get(grad_worker_key, {})
-                                            if flat_key in worker_gradients:
-                                                grad_tensor = worker_gradients[flat_key].to(device)
+                                            if role in worker_gradients and name in worker_gradients[role]:
+                                                grad_tensor = worker_gradients[role][name].to(device)
                                                 grad_sum += grad_tensor
                                                 count += 1
                                         except Exception:
@@ -297,7 +326,7 @@ class ParallelPPOTrainer:
                                 del shared_metrics[grad_key]
                             except (KeyError, TypeError):
                                 pass
-                
+
                 except Exception as e:
                     print(f"GPU {gpu_id} - Gradient aggregation disabled due to error: {e}")
                     gradient_aggregation = False
@@ -484,6 +513,13 @@ class ParallelPPOTrainer:
                                 print(f"NaN detected in rewards for {pod_key}. Replacing with zeros.")
                                 rewards[pod_key] = torch.zeros_like(rewards[pod_key])
                         
+                        # Log timeout penalties for debugging if available
+                        if 'timeout_penalties' in info:
+                            timeout_info = info['timeout_penalties']
+                            if step % 100 == 0:  # Log every 100 steps
+                                timeout_values = [float(timeout_info[i][0]) for i in range(4)]
+                                print(f"GPU {gpu_id} - Step {step} timeout penalties: {timeout_values}")
+                        
                         # Add experience to shared buffer
                         add_experience_to_shared_buffer(observations, actions, rewards, values, log_probs, dones)
                         
@@ -506,7 +542,7 @@ class ParallelPPOTrainer:
                                             trainer.pod_trails[pod_key] = trainer.pod_trails[pod_key][-50:]
                         
                         # Send race state to visualization occasionally
-                        if vis_queue is not None and step % 5 == 0:
+                        if vis_queue is not None and step % 10 == 0:
                             try:
                                 # Create a unique worker ID that includes both GPU ID and environment index
                                 worker_id = f"gpu_{gpu_id}_env_{env_indices[env_idx]}"
@@ -623,8 +659,10 @@ class ParallelPPOTrainer:
                         all_observations[env_idx] = next_observations
                         
                         # Reset environment if all episodes are done
+                        # NOTE: Episodes now only reset when race is completed, not on timeout
                         if dones.all():
                             all_observations[env_idx] = env.reset()
+                            print(f"GPU {gpu_id} - Environment {env_idx} reset due to race completion")
                         
                         # Ensure synchronization between operations
                         if device.type == 'cuda':
@@ -766,6 +804,13 @@ class ParallelPPOTrainer:
                 print(f"GPU {gpu_id} - Initializing shared model parameters")
                 update_shared_models()
 
+            # Training metrics tracking for timeout prevention
+            timeout_penalty_stats = {
+                'total_penalties': 0,
+                'max_penalty_per_iteration': 0,
+                'episodes_with_penalties': 0
+            }
+
             for iteration in range(1, training_args['num_iterations'] + 1):
                 start_time = time.time()
                 
@@ -803,16 +848,26 @@ class ParallelPPOTrainer:
                     # Calculate elapsed time since start of iteration
                     elapsed_time = time.time() - start_time
                     
-                    # Calculate role-specific average rewards
+                    # Calculate role-specific average rewards and timeout penalties
                     runner_reward = 0
                     blocker_reward = 0
                     runner_count = 0
                     blocker_count = 0
+                    total_timeout_penalties = 0
+                    max_timeout_penalty = 0
+                    episodes_with_timeout_penalty = 0
 
                     for pod_key in trainer.pod_networks.keys():
                         if 'rewards' in trainer.storage[pod_key]:
                             rewards = torch.cat([r for r in trainer.storage[pod_key]['rewards']])
                             avg_pod_reward = rewards.mean().item()
+                            
+                            # Check for timeout penalties in rewards (negative values beyond normal reward range)
+                            timeout_penalties = rewards[rewards < -0.1]  # Assuming normal rewards are >= -0.1
+                            if len(timeout_penalties) > 0:
+                                total_timeout_penalties += len(timeout_penalties)
+                                max_timeout_penalty = max(max_timeout_penalty, abs(timeout_penalties.min().item()))
+                                episodes_with_timeout_penalty += 1
                             
                             # Determine if this is a runner or blocker
                             if 'pod0' in pod_key:  # Runner
@@ -826,25 +881,42 @@ class ParallelPPOTrainer:
                     avg_blocker_reward = blocker_reward / max(1, blocker_count)
                     avg_total_reward = (runner_reward + blocker_reward) / max(1, runner_count + blocker_count)
 
+                    # Update timeout penalty statistics
+                    timeout_penalty_stats['total_penalties'] += total_timeout_penalties
+                    timeout_penalty_stats['max_penalty_per_iteration'] = max(
+                        timeout_penalty_stats['max_penalty_per_iteration'], 
+                        max_timeout_penalty
+                    )
+                    timeout_penalty_stats['episodes_with_penalties'] += episodes_with_timeout_penalty
+
                     # Coordinate learning rates based on performance
                     coordinate_learning_rates(avg_total_reward)
                     
                     # Get current learning rate after coordination
                     current_lr = trainer.optimizers[next(iter(trainer.optimizers))].param_groups[0]['lr']
 
-                    # Log progress with role-specific information
+                    # Log progress with role-specific information and timeout prevention metrics
                     print(f"GPU {gpu_id} - Iteration {iteration}/{training_args['num_iterations']} completed in {elapsed_time:.2f}s")
                     print(f"  Total reward: {avg_total_reward:.4f}")
                     print(f"  Runner reward: {avg_runner_reward:.4f}")
                     print(f"  Blocker reward: {avg_blocker_reward:.4f}")
                     print(f"  Policy loss: {policy_loss:.4f}, Value loss: {value_loss:.4f}, lr={current_lr:.6f}")
+                    
+                    # Log timeout prevention metrics
+                    if total_timeout_penalties > 0:
+                        print(f"  TIMEOUT PENALTIES: {total_timeout_penalties} occurrences, max penalty: {max_timeout_penalty:.4f}")
+                        print(f"  Episodes with penalties: {episodes_with_timeout_penalty}")
+                    else:
+                        print(f"  NO TIMEOUT PENALTIES - agents actively racing!")
 
-                    # Log metrics to file with role breakdown
+                    # Log metrics to file with role breakdown and timeout prevention
                     with open(log_file, 'a') as f:
                         f.write(f"iteration={iteration},total_reward={avg_total_reward:.4f},"
                             f"runner_reward={avg_runner_reward:.4f},blocker_reward={avg_blocker_reward:.4f},"
                             f"policy_loss={policy_loss:.4f},value_loss={value_loss:.4f},"
-                            f"time={elapsed_time:.2f},lr={current_lr:.6f}\n")
+                            f"time={elapsed_time:.2f},lr={current_lr:.6f},"
+                            f"timeout_penalties={total_timeout_penalties},max_penalty={max_timeout_penalty:.4f},"
+                            f"episodes_with_penalties={episodes_with_timeout_penalty}\n")
 
                     # Send enhanced metrics to visualization if enabled
                     if vis_queue is not None:
@@ -856,6 +928,9 @@ class ParallelPPOTrainer:
                             'policy_loss': policy_loss,
                             'value_loss': value_loss,
                             'learning_rate': current_lr,
+                            'timeout_penalties': total_timeout_penalties,
+                            'max_timeout_penalty': max_timeout_penalty,
+                            'episodes_with_penalties': episodes_with_timeout_penalty,
                             'worker_id': f"gpu_{gpu_id}"
                         }
                         vis_queue.put(metrics)
@@ -881,8 +956,8 @@ class ParallelPPOTrainer:
                                 # Determine role based on team_pod_idx
                                 role = "runner" if team_pod_idx == 0 else "blocker"
                                 
-                                # Create descriptive filename with role
-                                base_filename = f"player{player_idx}_{role}_gpu{gpu_id}"
+                                # Create descriptive filename with role and timeout prevention info
+                                base_filename = f"player{player_idx}_{role}_notimeout_gpu{gpu_id}"
                                 
                                 # Save with iteration number
                                 torch.save(network.state_dict(), save_dir / f"{base_filename}_iter{iteration}.pt")
@@ -891,6 +966,20 @@ class ParallelPPOTrainer:
                                 print(f"GPU {gpu_id} - Models saved at iteration {iteration} as {base_filename}")
                             else:
                                 print(f"GPU {gpu_id} - Not saving model for {pod_key} due to NaN parameters")
+                    
+                    # Report timeout prevention progress every 10 iterations
+                    if iteration % 10 == 0:
+                        avg_penalties_per_iter = timeout_penalty_stats['total_penalties'] / iteration
+                        print(f"GPU {gpu_id} - TIMEOUT PREVENTION REPORT (Iteration {iteration}):")
+                        print(f"  Average penalties per iteration: {avg_penalties_per_iter:.2f}")
+                        print(f"  Max penalty seen: {timeout_penalty_stats['max_penalty_per_iteration']:.4f}")
+                        print(f"  Episodes with penalties: {timeout_penalty_stats['episodes_with_penalties']}")
+                        
+                        # Success metric: low penalty rate indicates agents are actively racing
+                        if avg_penalties_per_iter < 1.0:
+                            print(f"  SUCCESS: Low penalty rate indicates agents are actively racing!")
+                        elif avg_penalties_per_iter > 5.0:
+                            print(f"  WARNING: High penalty rate - agents may still be exploiting timeouts")
                     
                     # Try enabling mixed precision after a few successful iterations if it was requested
                     if use_mixed_precision and not trainer.use_mixed_precision and iteration == 10:
@@ -914,7 +1003,7 @@ class ParallelPPOTrainer:
                     print(traceback.format_exc())
                     # Continue with next iteration instead of crashing
 
-            # Store results in shared dictionary
+            # Store results in shared dictionary with timeout prevention metrics
             shared_results[f'gpu_{gpu_id}'] = {
                 'completed': True,
                 'env_indices': env_indices,
@@ -926,6 +1015,12 @@ class ParallelPPOTrainer:
                 'final_losses': {
                     'policy': policy_loss,
                     'value': value_loss
+                },
+                'timeout_prevention_metrics': {
+                    'total_penalties': timeout_penalty_stats['total_penalties'],
+                    'avg_penalties_per_iteration': timeout_penalty_stats['total_penalties'] / training_args['num_iterations'],
+                    'max_penalty': timeout_penalty_stats['max_penalty_per_iteration'],
+                    'episodes_with_penalties': timeout_penalty_stats['episodes_with_penalties']
                 }
             }
 
@@ -939,9 +1034,10 @@ class ParallelPPOTrainer:
             }
 
     def train(self, visualization_panel=None):
-        """Start parallel training across GPUs with improved error handling and model synchronization"""
-        print("Starting parallel training with model synchronization...")
+        """Start parallel training across GPUs with improved error handling and timeout prevention"""
+        print("Starting parallel training with timeout penalty system...")
         print(f"Training parameters: num_iterations={self.trainer_args.get('num_iterations')}, steps_per_iteration={self.trainer_args.get('steps_per_iteration')}")
+        print(f"Timeout prevention enabled with penalty weight: {self.env_config.get('timeout_penalty_weight', 0.01)}")
         print(f"Synchronization settings:")
         print(f"  - Sync interval: {self.sync_interval}")
         print(f"  - Parameter server: {self.use_parameter_server}")
@@ -962,11 +1058,10 @@ class ParallelPPOTrainer:
             print("Setting up shared model parameters...")
             shared_models = manager.dict()
             
-            # Initialize shared model parameters - will be populated by first worker
-            pod_keys = ['player0_pod0', 'player0_pod1']  # Adjust based on your setup
-            for pod_key in pod_keys:
-                shared_models[pod_key] = manager.dict()
-            print(f"Initialized shared models for keys: {pod_keys}")
+            # Initialize shared model parameters by role instead of pod_key
+            shared_models['runner_network'] = manager.dict()
+            shared_models['blocker_network'] = manager.dict()
+            print("Initialized shared models for runner and blocker roles")
 
         # Create shared experience buffer if enabled
         shared_experience = None
@@ -1026,7 +1121,7 @@ class ParallelPPOTrainer:
             p.start()
 
         # Monitor training progress
-        print("Monitoring parallel training progress...")
+        print("Monitoring parallel training progress with timeout prevention...")
         start_time = time.time()
         last_sync_report = time.time()
         
@@ -1044,6 +1139,7 @@ class ParallelPPOTrainer:
                     
                     print(f"Training status after {elapsed_minutes:.1f} minutes:")
                     print(f"  - Active workers: {alive_workers}/{len(self.processes)}")
+                    print(f"  - Timeout prevention system active")
                     
                     # Report shared metrics if available
                     if shared_metrics:
@@ -1092,7 +1188,7 @@ class ParallelPPOTrainer:
         
         print("All worker processes completed")
         
-        # Report final results
+        # Report final results with timeout prevention metrics
         self._report_training_results(shared_results)
         
         # Check for errors in any of the processes
@@ -1106,13 +1202,13 @@ class ParallelPPOTrainer:
             print(error_msg)
             raise RuntimeError(error_msg)
         
-        print("Parallel training completed successfully")
+        print("Parallel training with timeout prevention completed successfully")
         return True
 
     def _report_training_results(self, shared_results):
-        """Report final training results from all workers"""
+        """Report final training results from all workers with timeout prevention metrics"""
         print("\n" + "="*60)
-        print("PARALLEL TRAINING RESULTS")
+        print("PARALLEL TRAINING RESULTS WITH TIMEOUT PREVENTION")
         print("="*60)
         
         total_rewards = []
@@ -1120,12 +1216,14 @@ class ParallelPPOTrainer:
         blocker_rewards = []
         policy_losses = []
         value_losses = []
+        timeout_metrics = []
         
         for key, result in shared_results.items():
             if result.get('completed', False):
                 gpu_id = key.replace('gpu_', '')
                 final_rewards = result.get('final_rewards', {})
                 final_losses = result.get('final_losses', {})
+                timeout_prevention = result.get('timeout_prevention_metrics', {})
                 
                 print(f"\nGPU {gpu_id} Results:")
                 print(f"  Total Reward: {final_rewards.get('total', 'N/A'):.4f}")
@@ -1133,6 +1231,23 @@ class ParallelPPOTrainer:
                 print(f"  Blocker Reward: {final_rewards.get('blocker', 'N/A'):.4f}")
                 print(f"  Policy Loss: {final_losses.get('policy', 'N/A'):.4f}")
                 print(f"  Value Loss: {final_losses.get('value', 'N/A'):.4f}")
+                
+                # Report timeout prevention metrics
+                if timeout_prevention:
+                    print(f"  Timeout Prevention Metrics:")
+                    print(f"    - Total penalties: {timeout_prevention.get('total_penalties', 0)}")
+                    print(f"    - Avg penalties/iteration: {timeout_prevention.get('avg_penalties_per_iteration', 0):.2f}")
+                    print(f"    - Max penalty: {timeout_prevention.get('max_penalty', 0):.4f}")
+                    print(f"    - Episodes with penalties: {timeout_prevention.get('episodes_with_penalties', 0)}")
+                    
+                    # Success indicator
+                    avg_penalties = timeout_prevention.get('avg_penalties_per_iteration', 0)
+                    if avg_penalties < 1.0:
+                        print(f"    - STATUS: SUCCESS - Agents actively racing!")
+                    elif avg_penalties < 5.0:
+                        print(f"    - STATUS: GOOD - Low timeout exploitation")
+                    else:
+                        print(f"    - STATUS: WARNING - High timeout exploitation")
                 
                 # Collect for averaging
                 if 'total' in final_rewards:
@@ -1145,6 +1260,8 @@ class ParallelPPOTrainer:
                     policy_losses.append(final_losses['policy'])
                 if 'value' in final_losses:
                     value_losses.append(final_losses['value'])
+                if timeout_prevention:
+                    timeout_metrics.append(timeout_prevention)
         
         # Calculate and report averages
         if total_rewards:
@@ -1154,6 +1271,27 @@ class ParallelPPOTrainer:
             print(f"  Average Blocker Reward: {np.mean(blocker_rewards):.4f} ± {np.std(blocker_rewards):.4f}")
             print(f"  Average Policy Loss: {np.mean(policy_losses):.4f} ± {np.std(policy_losses):.4f}")
             print(f"  Average Value Loss: {np.mean(value_losses):.4f} ± {np.std(value_losses):.4f}")
+        
+        # Report timeout prevention summary
+        if timeout_metrics:
+            total_penalties = sum(tm.get('total_penalties', 0) for tm in timeout_metrics)
+            avg_penalties_per_iter = np.mean([tm.get('avg_penalties_per_iteration', 0) for tm in timeout_metrics])
+            max_penalty_overall = max(tm.get('max_penalty', 0) for tm in timeout_metrics)
+            total_episodes_with_penalties = sum(tm.get('episodes_with_penalties', 0) for tm in timeout_metrics)
+            
+            print(f"\nTIMEOUT PREVENTION SUMMARY:")
+            print(f"  Total penalties across all workers: {total_penalties}")
+            print(f"  Average penalties per iteration: {avg_penalties_per_iter:.2f}")
+            print(f"  Maximum penalty seen: {max_penalty_overall:.4f}")
+            print(f"  Episodes with penalties: {total_episodes_with_penalties}")
+            
+            # Overall success assessment
+            if avg_penalties_per_iter < 1.0:
+                print(f"  OVERALL STATUS: ✅ SUCCESS - Timeout exploitation eliminated!")
+            elif avg_penalties_per_iter < 5.0:
+                print(f"  OVERALL STATUS: ⚠️  GOOD - Low timeout exploitation")
+            else:
+                print(f"  OVERALL STATUS: ❌ WARNING - Timeout exploitation still present")
         
         print("="*60)
 
@@ -1168,7 +1306,10 @@ class ParallelPPOTrainer:
                     
                     # Debug print to verify data is being received
                     if 'iteration' in data:
-                        print(f"Received metric data: iteration={data['iteration']}, reward={data.get('total_reward', 0):.4f}")
+                        timeout_info = ""
+                        if 'timeout_penalties' in data:
+                            timeout_info = f", penalties={data['timeout_penalties']}"
+                        print(f"Received metric data: iteration={data['iteration']}, reward={data.get('total_reward', 0):.4f}{timeout_info}")
                     elif 'race_state' in data:
                         print(f"Received race state data with {len(data['race_state'].get('pods', []))} pods")
                     

@@ -119,40 +119,35 @@ class ModelExporter:
             }
     
     def _adapt_config_to_state_dict(self, state_dict, base_config):
-        """Adapt configuration to exactly match the state dict structure"""
-        adapted_config = base_config.copy()
+        """Adapt configuration to match the actual state dict structure"""
+        adapted_config = base_config.copy() if base_config else {}
         
-        # Re-infer hidden layers more carefully
-        hidden_layers = []
-        layer_idx = 0
+        # Check for old parameter names and map them to new ones
+        if 'special_hidden_size' in adapted_config and 'action_hidden_size' not in adapted_config:
+            adapted_config['action_hidden_size'] = adapted_config['special_hidden_size']
         
-        # Get the first layer input size (observation_dim)
-        if 'encoder.0.weight' in state_dict:
-            adapted_config['observation_dim'] = state_dict['encoder.0.weight'].shape[1]
-        
-        # Build hidden layers to match state dict exactly
-        while f'encoder.{layer_idx}.weight' in state_dict:
-            weight_shape = state_dict[f'encoder.{layer_idx}.weight'].shape
-            hidden_size = weight_shape[0]
+        # Infer sizes from state dict if not in config
+        for key, tensor in state_dict.items():
+            if 'action_head' in key and 'weight' in key:
+                if key.endswith('0.weight'):  # First layer of action head
+                    adapted_config['action_hidden_size'] = tensor.shape[0]
+                elif key.endswith('2.weight'):  # Output layer of action head
+                    # Should be 4 for the new format
+                    expected_output_size = tensor.shape[0]
+                    if expected_output_size != 4:
+                        print(f"Warning: Action head output size is {expected_output_size}, expected 4")
             
-            hidden_layers.append({
-                'type': 'Linear+ReLU',  # Assume ReLU for now
-                'size': hidden_size
-            })
+            elif 'policy_head' in key and 'weight' in key:
+                if key.endswith('0.weight'):  # First layer of policy head (legacy)
+                    adapted_config['policy_hidden_size'] = tensor.shape[0]
             
-            layer_idx += 2  # Skip activation layer
-        
-        adapted_config['hidden_layers'] = hidden_layers
-        
-        # Adapt head sizes
-        if 'policy_head.0.weight' in state_dict:
-            adapted_config['policy_hidden_size'] = state_dict['policy_head.0.weight'].shape[0]
-        
-        if 'value_head.0.weight' in state_dict:
-            adapted_config['value_hidden_size'] = state_dict['value_head.0.weight'].shape[0]
-        
-        if 'special_action_head.0.weight' in state_dict:
-            adapted_config['special_hidden_size'] = state_dict['special_action_head.0.weight'].shape[0]
+            elif 'special_action_head' in key and 'weight' in key:
+                if key.endswith('0.weight'):  # First layer of special action head (legacy)
+                    adapted_config['special_hidden_size'] = tensor.shape[0]
+            
+            elif 'value_head' in key and 'weight' in key:
+                if key.endswith('0.weight'):  # First layer of value head
+                    adapted_config['value_hidden_size'] = tensor.shape[0]
         
         return adapted_config
     
@@ -168,7 +163,7 @@ class ModelExporter:
                 hidden_layers=config.get('hidden_layers', []),
                 policy_hidden_size=config.get('policy_hidden_size', 12),
                 value_hidden_size=config.get('value_hidden_size', 12),
-                special_hidden_size=config.get('special_hidden_size', 12)
+                action_hidden_size=config.get('action_hidden_size', 12)  # Updated parameter name
             )
             
             # Load state dict
@@ -195,7 +190,7 @@ class ModelExporter:
                     hidden_layers=adapted_config.get('hidden_layers', []),
                     policy_hidden_size=adapted_config.get('policy_hidden_size', 12),
                     value_hidden_size=adapted_config.get('value_hidden_size', 12),
-                    special_hidden_size=adapted_config.get('special_hidden_size', 12)
+                    action_hidden_size=adapted_config.get('action_hidden_size', 12)  # Updated parameter name
                 )
                 
                 model.load_state_dict(state_dict)
@@ -411,7 +406,7 @@ class ModelExporter:
         
         # Sigmoid activation
         code.append("def sigmoid(x):")
-        code.append("    return [1.0 / (1.0 + math.exp(-val)) for val in x]")
+        code.append("    return [1.0 / (1.0 + math.exp(-max(-500, min(500, val)))) for val in x]")  # Clamp to prevent overflow
         code.append("")
         
         return code
@@ -431,17 +426,50 @@ class ModelExporter:
             encoder_layers.append((f"encoder.{layer_idx}", layer_weights, layer_biases))
             layer_idx += 2  # Skip activation layers
         
-        # Extract head layers
+        # Extract head layers - Updated for new model structure
         head_layers = []
         
-        # Policy head layers
-        for head_name in ["policy_head", "value_head", "special_action_head"]:
-            head_layer_idx = 0
-            while f"{head_name}.{head_layer_idx}.weight" in weights:
-                layer_weights = weights[f"{head_name}.{head_layer_idx}.weight"]
-                layer_biases = weights[f"{head_name}.{head_layer_idx}.bias"]
-                head_layers.append((f"{head_name}.{head_layer_idx}", layer_weights, layer_biases))
-                head_layer_idx += 2  # Skip activation layers
+        # Action head layers (new structure)
+        action_layers = []
+        action_layer_idx = 0
+        while f"action_head.{action_layer_idx}.weight" in weights:
+            layer_weights = weights[f"action_head.{action_layer_idx}.weight"]
+            layer_biases = weights[f"action_head.{action_layer_idx}.bias"]
+            action_layers.append((f"action_head.{action_layer_idx}", layer_weights, layer_biases))
+            head_layers.append((f"action_head.{action_layer_idx}", layer_weights, layer_biases))
+            action_layer_idx += 2  # Skip activation layers
+        
+        # Value head layers
+        value_layers = []
+        value_layer_idx = 0
+        while f"value_head.{value_layer_idx}.weight" in weights:
+            layer_weights = weights[f"value_head.{value_layer_idx}.weight"]
+            layer_biases = weights[f"value_head.{value_layer_idx}.bias"]
+            value_layers.append((f"value_head.{value_layer_idx}", layer_weights, layer_biases))
+            head_layers.append((f"value_head.{value_layer_idx}", layer_weights, layer_biases))
+            value_layer_idx += 2  # Skip activation layers
+        
+        # Legacy support: Check for old policy_head and special_action_head
+        policy_layers = []
+        special_layers = []
+        
+        # Policy head layers (legacy)
+        policy_layer_idx = 0
+        while f"policy_head.{policy_layer_idx}.weight" in weights:
+            layer_weights = weights[f"policy_head.{policy_layer_idx}.weight"]
+            layer_biases = weights[f"policy_head.{policy_layer_idx}.bias"]
+            policy_layers.append((f"policy_head.{policy_layer_idx}", layer_weights, layer_biases))
+            head_layers.append((f"policy_head.{policy_layer_idx}", layer_weights, layer_biases))
+            policy_layer_idx += 2
+        
+        # Special action head layers (legacy)
+        special_layer_idx = 0
+        while f"special_action_head.{special_layer_idx}.weight" in weights:
+            layer_weights = weights[f"special_action_head.{special_layer_idx}.weight"]
+            layer_biases = weights[f"special_action_head.{special_layer_idx}.bias"]
+            special_layers.append((f"special_action_head.{special_layer_idx}", layer_weights, layer_biases))
+            head_layers.append((f"special_action_head.{special_layer_idx}", layer_weights, layer_biases))
+            special_layer_idx += 2
         
         # Generate layer functions with efficient encoding
         all_layers = encoder_layers + head_layers
@@ -454,9 +482,9 @@ class ModelExporter:
             )
             code.extend(layer_code)
         
-        # Generate forward function with dynamic layer handling
+        # Generate forward function - Updated for new model structure
         code.append(f"def {model_name}_forward(x):")
-        
+
         # Encoder layers
         current_var = "x"
         for i, (layer_name, _, _) in enumerate(encoder_layers):
@@ -465,46 +493,57 @@ class ModelExporter:
             code.append(f"    {next_var} = relu({next_var})")
             current_var = next_var
         
-        # Extract policy layers from head_layers
-        policy_layers = [layer for layer in head_layers if layer[0].startswith("policy_head")]
+        # Check if we have new action_head structure or legacy policy/special heads
+        if action_layers:
+            # New model structure with action_head
+            code.append(f"    # Action head (new structure)")
+            if len(action_layers) >= 2:
+                code.append(f"    action = {model_name}_action_head_0({current_var})")
+                code.append("    action = relu(action)")
+                code.append(f"    action = {model_name}_action_head_2(action)")
+            elif len(action_layers) == 1:
+                code.append(f"    action = {model_name}_action_head_0({current_var})")
+            
+            # Extract and process action components
+            code.append("    # Extract action components")
+            code.append("    angle = math.tanh(action[0])")  # Range: [-1, 1]
+            code.append("    thrust = sigmoid([action[1]])[0]")  # Range: [0, 1]
+            code.append("    shield_prob = sigmoid([action[2]])[0]")  # Range: [0, 1]
+            code.append("    boost_prob = sigmoid([action[3]])[0]")  # Range: [0, 1]
+            
+        else:
+            # Legacy model structure with separate policy and special heads
+            code.append(f"    # Policy head (legacy structure)")
+            if len(policy_layers) >= 2:
+                code.append(f"    policy = {model_name}_policy_head_0({current_var})")
+                code.append("    policy = relu(policy)")
+                code.append(f"    policy = {model_name}_policy_head_2(policy)")
+            elif len(policy_layers) == 1:
+                code.append(f"    policy = {model_name}_policy_head_0({current_var})")
+            
+            # Apply proper activations to policy outputs
+            code.append("    angle = math.tanh(policy[0])")  # Normalize to [-1,1]
+            code.append("    thrust = sigmoid([policy[1]])[0]")  # Normalize to [0,1]
+            
+            # Special actions head - handle variable number of layers
+            code.append(f"    # Special action head (legacy structure)")
+            if len(special_layers) >= 2:
+                code.append(f"    special = {model_name}_special_action_head_0({current_var})")
+                code.append("    special = relu(special)")
+                code.append(f"    special = {model_name}_special_action_head_2(special)")
+            elif len(special_layers) == 1:
+                code.append(f"    special = {model_name}_special_action_head_0({current_var})")
+            
+            # Apply proper activations to special action outputs
+            code.append("    shield_prob = sigmoid([special[0]])[0]")  # Normalize to [0,1]
+            code.append("    boost_prob = sigmoid([special[1]])[0]")  # Normalize to [0,1]
         
-        # Policy head - handle variable number of layers
-        if len(policy_layers) >= 2:
-            # Standard 2-layer policy head
-            code.append(f"    policy = {model_name}_policy_head_0({current_var})")
-            code.append("    policy = relu(policy)")
-            code.append(f"    policy = {model_name}_policy_head_2(policy)")
-        elif len(policy_layers) == 1:
-            # Single layer policy head
-            code.append(f"    policy = {model_name}_policy_head_0({current_var})")
-        
-        # Apply proper activations to policy outputs
-        code.append("    angle = math.tanh(policy[0])")  # Normalize to [-1,1]
-        code.append("    thrust = sigmoid([policy[1]])[0]")  # Normalize to [0,1]
-        
-        # Extract special action layers from head_layers
-        special_layers = [layer for layer in head_layers if layer[0].startswith("special_action_head")]
-        
-        # Special actions head - handle variable number of layers
-        if len(special_layers) >= 2:
-            # Standard 2-layer special head
-            code.append(f"    special = {model_name}_special_action_head_0({current_var})")
-            code.append("    special = relu(special)")
-            code.append(f"    special = {model_name}_special_action_head_2(special)")
-        elif len(special_layers) == 1:
-            # Single layer special head
-            code.append(f"    special = {model_name}_special_action_head_0({current_var})")
-        
-        # Apply proper activations to special action outputs
-        code.append("    shield_prob = sigmoid([special[0]])[0]")  # Normalize to [0,1]
-        code.append("    boost_prob = sigmoid([special[1]])[0]")  # Normalize to [0,1]
-        
-        # Return processed outputs
+        # Return processed outputs (same format for both structures)
         code.append("    return angle, thrust, shield_prob, boost_prob")
         code.append("")
         
         return code
-      
+    
     def _generate_observation_code(self):
         """Generate code for processing observations to match training environment (56 dimensions)"""
         code = []
@@ -811,7 +850,7 @@ class ModelExporter:
         code.append("            angle_output, thrust, shield_prob, boost_prob = blocker_forward(obs)")
         code.append("")
         
-        # Convert outputs to game commands
+        # Convert outputs to game commands - FIXED VERSION
         code.append("        # Convert model outputs to action format")
         code.append("        x, y, vx, vy, angle, next_checkpoint_id = pod_data_all[pod_id]")
         code.append("        next_checkpoint_x, next_checkpoint_y = checkpoints[next_checkpoint_id]")
@@ -831,16 +870,19 @@ class ModelExporter:
         code.append("        target_y = y + math.sin(target_angle_rad) * target_distance")
         code.append("")
 
-        # Determine thrust value - CORRECTED VERSION
-        code.append("        # Convert special actions to thrust_value format (matching environment)")
+        # Determine thrust value - CORRECTED VERSION using special action probabilities
+        code.append("        # Determine action based on model outputs")
+        code.append("        # Priority: Shield > Boost > Normal Thrust")
         code.append("        if shield_prob > 0.5:")
         code.append("            thrust_command = 'SHIELD'")
         code.append("        elif boost_prob > 0.5 and not boost_used[pod_id]:")
         code.append("            thrust_command = 'BOOST'")
         code.append("            boost_used[pod_id] = True")
         code.append("        else:")
+        code.append("            # Convert normalized thrust [0, 1] to game thrust [0, 100]")
         code.append("            thrust_value = max(0, min(100, int(thrust * 100)))")
-        code.append("           thrust_command = str(thrust_value)")
+        code.append("            thrust_command = str(thrust_value)")
+        code.append("")
 
         # Store command for this pod
         code.append("        # Store command for this pod")
@@ -854,7 +896,6 @@ class ModelExporter:
         code.append("")
         
         return code
-
     def validate_models(self):
         """Validate that models are properly loaded and compatible for export"""
         issues = []

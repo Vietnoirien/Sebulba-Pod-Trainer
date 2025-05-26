@@ -14,8 +14,8 @@ class VisualizationConnector:
         self.metrics_buffer = defaultdict(lambda: deque(maxlen=1000))  # Reduced buffer size
         self.race_state_buffer = {}
         self.last_update_time = defaultdict(float)
-        self.update_frequency = 2.0  # Reduced frequency: Update visualization every 2 seconds
-        self.race_update_frequency = 0.05  # Update race visualization every 500ms
+        self.update_frequency = 1.0  # Reduced frequency: Update visualization every seconds
+        self.race_update_frequency = 0.5  # Update race visualization every 500ms
         self.last_race_update = defaultdict(float)
         print("VisualizationConnector initialized")
     

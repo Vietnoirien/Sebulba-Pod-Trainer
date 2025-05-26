@@ -13,8 +13,13 @@ class PodNetwork(nn.Module):
                  hidden_layers: List[Dict[str, Any]] = None,
                  policy_hidden_size: int = 12,  # Reduced from 16
                  value_hidden_size: int = 12,   # Reduced from 16
-                 special_hidden_size: int = 12): # Reduced from 16
+                 action_hidden_size: int = 12,  # Renamed from special_hidden_size
+                 special_hidden_size: int = None):  # Keep for backward compatibility
         super().__init__()
+
+        # Handle backward compatibility
+        if special_hidden_size is not None:
+            action_hidden_size = special_hidden_size
 
         self.input_dim = observation_dim
         
@@ -60,11 +65,11 @@ class PodNetwork(nn.Module):
         # Get the output size of the encoder
         encoder_output_size = hidden_layers[-1]['size']
         
-        # Policy head (outputs angle and thrust) - SMALLER
-        self.policy_head = nn.Sequential(
-            nn.Linear(encoder_output_size, policy_hidden_size),
+        # Action head (outputs all 4 action components) - UPDATED
+        self.action_head = nn.Sequential(
+            nn.Linear(encoder_output_size, action_hidden_size),
             nn.ReLU(),
-            nn.Linear(policy_hidden_size, 2),  # angle and thrust
+            nn.Linear(action_hidden_size, 4),  # angle, thrust, shield_prob, boost_prob
         )
         
         # Value head (estimates expected reward) - SMALLER
@@ -72,13 +77,6 @@ class PodNetwork(nn.Module):
             nn.Linear(encoder_output_size, value_hidden_size),
             nn.ReLU(),
             nn.Linear(value_hidden_size, 1),
-        )
-        
-        # Special action head (for SHIELD and BOOST decisions) - SMALLER
-        self.special_action_head = nn.Sequential(
-            nn.Linear(encoder_output_size, special_hidden_size),
-            nn.ReLU(),
-            nn.Linear(special_hidden_size, 2),  # shield and boost logits
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -89,70 +87,55 @@ class PodNetwork(nn.Module):
             x: Observation tensor
             
         Returns:
-            actions: Tensor with [angle, thrust] values
+            actions: Tensor with [angle, thrust, shield_prob, boost_prob] values
             value: Estimated value of the state
-            special_probs: Probabilities for special actions [shield_prob, boost_prob]
+            special_probs: Probabilities for special actions [shield_prob, boost_prob] (for backward compatibility)
         """
         # Encode observations
         encoded = self.encoder(x)
         
-        # Get policy outputs
-        raw_actions = self.policy_head(encoded)
+        # Get action outputs
+        raw_actions = self.action_head(encoded)
         
         # Process actions
         angle = torch.tanh(raw_actions[:, 0:1])  # Range: [-1, 1]
         thrust = torch.sigmoid(raw_actions[:, 1:2])  # Range: [0, 1]
+        shield_prob = torch.sigmoid(raw_actions[:, 2:3])  # Range: [0, 1]
+        boost_prob = torch.sigmoid(raw_actions[:, 3:4])  # Range: [0, 1]
         
         # Combine into action tensor
-        actions = torch.cat([angle, thrust], dim=1)
+        actions = torch.cat([angle, thrust, shield_prob, boost_prob], dim=1)
         
         # Get value estimate
         value = self.value_head(encoded)
         
-        # Get special action probabilities
-        special_logits = self.special_action_head(encoded)
-        special_probs = torch.sigmoid(special_logits)
+        # Extract special action probabilities for backward compatibility
+        special_probs = torch.cat([shield_prob, boost_prob], dim=1)
         
         return actions, value, special_probs
     
     def get_actions(self, 
-                   observations: torch.Tensor, 
-                   deterministic: bool = False) -> torch.Tensor:
+                observations: torch.Tensor, 
+                deterministic: bool = False) -> torch.Tensor:
         """
         Get actions from observations, with optional exploration
-        
-        Args:
-            observations: Batch of observations
-            deterministic: If True, return deterministic actions, otherwise sample
-            
-        Returns:
-            actions: Tensor with [angle, thrust] values
         """
-        actions, _, special_probs = self.forward(observations)
+        actions, _, _ = self.forward(observations)
         
         if not deterministic:
             # Add exploration noise to angle
             angle_noise = torch.randn_like(actions[:, 0:1]) * 0.1
             actions[:, 0:1] = torch.clamp(actions[:, 0:1] + angle_noise, -1.0, 1.0)
             
-            # Sample special actions
-            shield_prob = special_probs[:, 0:1]
-            boost_prob = special_probs[:, 1:2]
+            # Add small exploration noise to thrust
+            thrust_noise = torch.randn_like(actions[:, 1:2]) * 0.05
+            actions[:, 1:2] = torch.clamp(actions[:, 1:2] + thrust_noise, 0.0, 1.0)
             
-            # Apply shield with probability
-            shield_action = torch.bernoulli(shield_prob)
-            actions[:, 1:2] = torch.where(
-                shield_action > 0.5,
-                torch.tensor(-1.0, device=actions.device),
-                actions[:, 1:2]
-            )
+            # Add small exploration noise to special action probabilities
+            shield_noise = torch.randn_like(actions[:, 2:3]) * 0.05
+            actions[:, 2:3] = torch.clamp(actions[:, 2:3] + shield_noise, 0.0, 1.0)
             
-            # Apply boost with probability (if not shielding)
-            boost_action = torch.bernoulli(boost_prob) * (1.0 - shield_action)
-            actions[:, 1:2] = torch.where(
-                boost_action > 0.5,
-                torch.tensor(1.0, device=actions.device),
-                actions[:, 1:2]
-            )
+            boost_noise = torch.randn_like(actions[:, 3:4]) * 0.05
+            actions[:, 3:4] = torch.clamp(actions[:, 3:4] + boost_noise, 0.0, 1.0)
         
         return actions

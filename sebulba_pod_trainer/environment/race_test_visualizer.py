@@ -162,24 +162,32 @@ class RaceTestVisualizer:
             )
     
     def _get_random_actions(self) -> Dict[str, torch.Tensor]:
-        """Generate random actions for all pods"""
+        """Generate random actions for all pods - UPDATED for 4-dimensional actions"""
         actions = {}
         for i in range(4):
             player_idx = i // 2
             team_pod_idx = i % 2
             pod_key = f"player{player_idx}_pod{team_pod_idx}"
             
-            # Random angle adjustment [-1, 1] and thrust [0, 1]
+            # Random angle adjustment [-1, 1]
             angle = torch.rand(1, 1, device=self.env.device) * 2 - 1  # [-1, 1]
+            
+            # Random thrust [0, 1]
             thrust = torch.rand(1, 1, device=self.env.device)  # [0, 1]
+            
+            # Random shield probability [0, 1] - low chance
+            shield_prob = torch.rand(1, 1, device=self.env.device) * 0.1  # [0, 0.1] - mostly no shield
+            
+            # Random boost probability [0, 1] - low chance
+            boost_prob = torch.rand(1, 1, device=self.env.device) * 0.1  # [0, 0.1] - mostly no boost
             
             # Occasionally use boost or shield
             if torch.rand(1).item() < 0.01:  # 1% chance for boost
-                thrust = torch.ones(1, 1, device=self.env.device)  # Boost (>0.9)
+                boost_prob = torch.ones(1, 1, device=self.env.device)  # High boost probability
             elif torch.rand(1).item() < 0.01:  # 1% chance for shield
-                thrust = -torch.ones(1, 1, device=self.env.device)  # Shield (<-0.9)
+                shield_prob = torch.ones(1, 1, device=self.env.device)  # High shield probability
                 
-            actions[pod_key] = torch.cat([angle, thrust], dim=1)
+            actions[pod_key] = torch.cat([angle, thrust, shield_prob, boost_prob], dim=1)
         
         return actions
     
@@ -199,7 +207,7 @@ class RaceTestVisualizer:
         return self.pod_stuck_counters[pod_idx] > 10  # Stuck for more than 10 steps
     
     def _get_simple_ai_actions(self) -> Dict[str, torch.Tensor]:
-        """Generate simple AI actions for all pods with anti-stuck mechanisms"""
+        """Generate simple AI actions for all pods - UPDATED for 4-dimensional actions"""
         actions = {}
         self.action_counter += 1
         
@@ -250,15 +258,21 @@ class RaceTestVisualizer:
             # Calculate distance to next checkpoint
             distance = np.sqrt(dx**2 + dy**2)
             
+            # Initialize action probabilities
+            shield_prob = 0.0
+            boost_prob = 0.0
+            thrust_value = 0.5  # Default thrust
+            
             # Determine thrust with more variation
             if is_stuck:
-                # If stuck, try different thrust patterns
+                # If stuck, try different action patterns
                 if self.pod_stuck_counters[i] % 4 == 0:
                     thrust_value = 1.0  # Full thrust
                 elif self.pod_stuck_counters[i] % 4 == 1:
                     thrust_value = 0.0  # No thrust
                 elif self.pod_stuck_counters[i] % 4 == 2:
-                    thrust_value = -1.0  # Shield
+                    shield_prob = 1.0  # Shield
+                    thrust_value = 0.0
                 else:
                     thrust_value = 0.5  # Half thrust
             else:
@@ -280,23 +294,28 @@ class RaceTestVisualizer:
                 
                 # Occasional special actions
                 if np.random.random() < 0.05:  # 5% chance
-                    if np.random.random() < 0.5:
-                        thrust_value = 1.1  # Boost
-                    else:
-                        thrust_value = -1.0  # Shield
-                        print("Shield activated!")
+                    if np.random.random() < 0.3:  # 30% of special actions are boost
+                        boost_prob = 1.0
+                        print(f"Pod {i}: Boost activated!")
+                    else:  # 70% of special actions are shield
+                        shield_prob = 1.0
+                        thrust_value = 0.0
+                        print(f"Pod {i}: Shield activated!")
             
-            # Create tensors
+            # Create tensors for 4-dimensional action
             angle_tensor = torch.tensor([[normalized_angle]], device=self.env.device, dtype=torch.float32)
             thrust_tensor = torch.tensor([[thrust_value]], device=self.env.device, dtype=torch.float32)
+            shield_tensor = torch.tensor([[shield_prob]], device=self.env.device, dtype=torch.float32)
+            boost_tensor = torch.tensor([[boost_prob]], device=self.env.device, dtype=torch.float32)
             
             # Store action in history (keep last 5 actions)
-            action_tuple = (normalized_angle, thrust_value)
+            action_tuple = (normalized_angle, thrust_value, shield_prob, boost_prob)
             self.pod_action_history[i].append(action_tuple)
             if len(self.pod_action_history[i]) > 5:
                 self.pod_action_history[i].pop(0)
             
-            actions[pod_key] = torch.cat([angle_tensor, thrust_tensor], dim=1)
+            # Combine all action components into 4-dimensional tensor
+            actions[pod_key] = torch.cat([angle_tensor, thrust_tensor, shield_tensor, boost_tensor], dim=1)
         
         return actions
     
@@ -373,6 +392,13 @@ class RaceTestVisualizer:
                 stuck_pods = [i for i in range(4) if self.pod_stuck_counters[i] > 5]
                 if stuck_pods:
                     print(f"  Stuck pods: {stuck_pods}")
+                
+                # Show action info for debugging
+                if step % 50 == 0:  # Less frequent action debugging
+                    for pod_key, action in actions.items():
+                        action_vals = action[0].cpu().numpy()
+                        print(f"  {pod_key}: angle={action_vals[0]:.2f}, thrust={action_vals[1]:.2f}, "
+                              f"shield={action_vals[2]:.2f}, boost={action_vals[3]:.2f}")
             
             # Delay for visualization
             time.sleep(delay)
@@ -424,6 +450,7 @@ def main():
     print(f"Checkpoints: {args.checkpoints}, Laps: {args.laps}")
     print(f"AI Mode: {args.ai}, Device: {args.device}")
     print(f"Controls: ESC=Quit, R=Reset, SPACE=Pause")
+    print(f"Action format: 4D [angle, thrust, shield_prob, boost_prob]")
     
     visualizer = RaceTestVisualizer(
         num_checkpoints=args.checkpoints,

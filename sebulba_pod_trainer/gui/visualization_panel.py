@@ -916,26 +916,6 @@ class VisualizationPanel(wx.Panel):
             return self.find_latest_model_file(pod_key, model_path)
         else:  # Best Performance
             return self.find_best_performance_model_file(pod_key, model_path)
-    def get_manual_selected_model(self, pod_key, model_path):
-        """Get manually selected model file"""
-        selection = self.manual_model_choice.GetSelection()
-        if selection == wx.NOT_FOUND:
-            return None
-            
-        selected_text = self.manual_model_choice.GetString(selection)
-        
-        # Extract filename from the display text
-        if ": " in selected_text:
-            filename = selected_text.split(": ", 1)[1]
-            model_file = model_path / filename
-            
-            # Check if this file matches the requested pod (convert pod_key to role if needed)
-            role = self.pod_key_to_role(pod_key)
-            if (role in filename or pod_key in filename) and model_file.exists():
-                return model_file
-        
-        # Fallback to best performance if manual selection doesn't match
-        return self.find_best_performance_model_file(pod_key, model_path)
 
     def pod_key_to_role(self, pod_key):
         """Convert pod_key to role name"""
@@ -1203,17 +1183,30 @@ class VisualizationPanel(wx.Panel):
                         hidden_size = weight_shape[0]  # Output size of this layer
                         hidden_layers.append({'type': 'Linear+ReLU', 'size': hidden_size})
                 
-                # Get head sizes from checkpoint
+                # Get head sizes from checkpoint - check all possible key names
                 policy_hidden_size = 16  # Default
                 value_hidden_size = 16   # Default
-                special_hidden_size = 16 # Default
+                action_hidden_size = 16  # Default
                 
+                # Check for policy head
                 if 'policy_head.0.weight' in checkpoint:
                     policy_hidden_size = checkpoint['policy_head.0.weight'].shape[0]
+                
+                # Check for value head
                 if 'value_head.0.weight' in checkpoint:
                     value_hidden_size = checkpoint['value_head.0.weight'].shape[0]
-                if 'special_action_head.0.weight' in checkpoint:
-                    special_hidden_size = checkpoint['special_action_head.0.weight'].shape[0]
+                
+                # Check for action head (try multiple possible key names for backward compatibility)
+                action_head_keys = [
+                    'action_head.0.weight',           # Current name
+                    'special_action_head.0.weight',   # Legacy name
+                    'special_head.0.weight'           # Another possible legacy name
+                ]
+                
+                for key in action_head_keys:
+                    if key in checkpoint:
+                        action_hidden_size = checkpoint[key].shape[0]
+                        break
                 
                 # Create network with matching architecture
                 network = PodNetwork(
@@ -1221,7 +1214,7 @@ class VisualizationPanel(wx.Panel):
                     hidden_layers=hidden_layers,
                     policy_hidden_size=policy_hidden_size,
                     value_hidden_size=value_hidden_size,
-                    special_hidden_size=special_hidden_size
+                    action_hidden_size=action_hidden_size  # Use action_hidden_size instead of special_hidden_size
                 )
                 
                 return network, checkpoint
@@ -1298,10 +1291,11 @@ class VisualizationPanel(wx.Panel):
             
             # Run race
             done = False
-            max_steps = 1000  # Limit steps to avoid infinite loops
+            max_steps = 600  # Limit steps to avoid infinite loops
             
             for step in range(max_steps):
                 if done:
+                    wx.CallAfter(self.sim_results.AppendText, f"Race ended at step {step} - done={done}\n")
                     break
                 
                 # Get actions from all pod networks
