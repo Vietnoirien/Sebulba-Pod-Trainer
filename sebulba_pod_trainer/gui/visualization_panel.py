@@ -49,7 +49,7 @@ class VisualizationPanel(wx.Panel):
         # Start update timer for real-time plotting
         self.update_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_timer, self.update_timer)
-        self.update_timer.Start(500)  # Update every 500ms
+        self.update_timer.Start(100)  # Update every 100ms
     
     def create_ui(self):
         # Main sizer
@@ -415,19 +415,38 @@ class VisualizationPanel(wx.Panel):
         self.race_figure.tight_layout()
     
     def update_plots(self):
-        """Update plots with current data - optimized version"""
+        """Update plots with current data - optimized for recording/playback"""
         if not self.iterations:
             return
         
         try:
+            # Only update if enough time has passed (throttling)
+            current_time = time.time()
+            if hasattr(self, 'last_plot_redraw') and current_time - self.last_plot_redraw < 0.2:
+                return
+            
+            # Limit data points for performance (show last 1000 points)
+            max_points = 1000
+            if len(self.iterations) > max_points:
+                start_idx = len(self.iterations) - max_points
+                iterations = self.iterations[start_idx:]
+                rewards = self.rewards[start_idx:]
+                policy_losses = self.policy_losses[start_idx:]
+                value_losses = self.value_losses[start_idx:]
+            else:
+                iterations = self.iterations
+                rewards = self.rewards
+                policy_losses = self.policy_losses
+                value_losses = self.value_losses
+            
             # Update rewards plot
-            self.rewards_line.set_data(self.iterations, self.rewards)
+            self.rewards_line.set_data(iterations, rewards)
             self.rewards_ax.relim()
             self.rewards_ax.autoscale_view()
             
             # Update losses plot
-            self.policy_line.set_data(self.iterations, self.policy_losses)
-            self.value_line.set_data(self.iterations, self.value_losses)
+            self.policy_line.set_data(iterations, policy_losses)
+            self.value_line.set_data(iterations, value_losses)
             self.losses_ax.relim()
             self.losses_ax.autoscale_view()
             
@@ -435,8 +454,12 @@ class VisualizationPanel(wx.Panel):
             self.rewards_canvas.draw_idle()
             self.losses_canvas.draw_idle()
             
+            # Add the throttling timestamp
+            self.last_plot_redraw = current_time
+            
         except Exception as e:
-            print(f"Error updating plots: {e}")    
+            print(f"Error updating plots: {e}")
+
     def _add_metric_data(self, iteration, reward, policy_loss, value_loss):
         """Add metric data to the internal lists (thread-safe)"""
         try:
@@ -459,75 +482,61 @@ class VisualizationPanel(wx.Panel):
             traceback.print_exc()
     
     def on_timer(self, event):
-        """Process any new metrics data from the queue with throttling"""
+        """Process any new metrics data from the queue - now handled by VisualizationConnector"""
+        # The VisualizationConnector now handles all the heavy lifting
+        # This timer just needs to handle any remaining direct updates
+        
         if not self.live_check.GetValue() or self.updating_visualization:
             return
         
+        # The recording/playback system in VisualizationConnector handles most updates
+        # We just need to handle any direct queue items that bypass the connector
         current_time = time.time()
         
-        # Throttle plot updates
+        # Throttle any remaining direct updates
         if current_time - self.last_plot_update < self.plot_update_interval:
             return
             
         self.updating_visualization = True
         
         try:
-            # Process metrics with limited batch size to prevent UI blocking
+            # Process any remaining direct metrics (fallback)
             metrics_processed = 0
-            max_metrics_per_update = 10  # Limit processing per timer tick
+            max_metrics_per_update = 5  # Reduced since connector handles most
             
             while not self.metrics_queue.empty() and metrics_processed < max_metrics_per_update:
                 try:
                     metric = self.metrics_queue.get_nowait()
                     
-                    # Handle metrics with iteration data
+                    # Handle direct metrics (fallback path)
                     if 'iteration' in metric:
-                        worker_id = metric.get('worker_id', 'main')
-                        iteration = metric['iteration']
-                        
-                        # Add metric data directly (already on main thread)
-                        self.iterations.append(iteration)
+                        self.iterations.append(metric['iteration'])
                         self.rewards.append(metric.get('total_reward', metric.get('reward', 0)))
                         self.policy_losses.append(metric.get('policy_loss', 0))
                         self.value_losses.append(metric.get('value_loss', 0))
-                        
-                        metrics_processed += 1
-                        
-                    # Handle race state visualization with throttling
-                    elif 'race_state' in metric:
-                        worker_id = metric['race_state'].get('worker_id', 'main')
-                        
-                        # Throttle race visualization updates per worker
-                        if worker_id not in self.last_race_update:
-                            self.last_race_update[worker_id] = 0
-                            
-                        if current_time - self.last_race_update[worker_id] >= self.race_update_interval:
-                            self.update_race_visualization_throttled(metric['race_state'], worker_id)
-                            self.last_race_update[worker_id] = current_time
-                            self.add_worker_to_dropdown(worker_id)
-                        
                         metrics_processed += 1
                         
                 except queue.Empty:
                     break
             
-            # Update plots only if we processed metrics and enough time has passed
+            # Update plots only if we processed metrics
             if metrics_processed > 0:
                 self.update_plots()
                 self.last_plot_update = current_time
                 
         except Exception as e:
             print(f"Error in on_timer: {e}")
-            import traceback
-            traceback.print_exc()
         finally:
             self.updating_visualization = False
 
     def update_race_visualization_throttled(self, race_state, worker_id='main'):
-        """Update race visualization with throttling to prevent UI freezing"""
+        """Update race visualization - now optimized for recording/playback system"""
         try:
             # Store the race state for this worker
             self.race_visualizations[worker_id] = race_state
+            
+            # Add worker to dropdown if needed
+            self.add_worker_to_dropdown(worker_id)
             
             # Only update visualization if this worker is currently being displayed
             should_update = False
@@ -541,17 +550,17 @@ class VisualizationPanel(wx.Panel):
                     should_update = (worker_id == selected_worker)
             
             if should_update:
-                # Use a separate thread for heavy matplotlib operations
-                threading.Thread(
-                    target=self._update_race_plot_async,
-                    args=(worker_id, race_state),
-                    daemon=True
-                ).start()
-                
+                # Update layout if needed
+                if self.active_worker_id == "All Environments" and worker_id not in self.race_axes:
+                    self.update_race_plot_layout()
+                else:
+                    # Draw the specific environment
+                    self.draw_single_race_environment(worker_id, race_state)
+                    # Use draw_idle for better performance
+                    self.race_canvas.draw_idle()
+                    
         except Exception as e:
             print(f"Error in update_race_visualization_throttled: {e}")
-            import traceback
-            traceback.print_exc()
 
     def _update_race_plot_async(self, worker_id, race_state):
         """Update race plot in a separate thread and then update UI"""
@@ -578,25 +587,37 @@ class VisualizationPanel(wx.Panel):
             traceback.print_exc()
     
     def add_worker_to_dropdown(self, worker_id):
-        """Add a worker to the dropdown if it's not already there"""
-        # Add to single worker dropdown
-        single_worker_choices = [self.single_worker_choice.GetString(i) for i in range(self.single_worker_choice.GetCount())]
-        if worker_id not in single_worker_choices:
-            self.single_worker_choice.Append(worker_id)
-        
-        # Check if we need to update the race plot layout
-        if self.active_worker_id == "All Environments":
-            self.update_race_plot_layout()
-    
+        """Add a worker to the dropdown if it's not already there - optimized"""
+        try:
+            # Add to single worker dropdown efficiently
+            single_worker_choices = [self.single_worker_choice.GetString(i) 
+                                   for i in range(self.single_worker_choice.GetCount())]
+            if worker_id not in single_worker_choices:
+                self.single_worker_choice.Append(worker_id)
+                
+                # Auto-select first worker in single mode if none selected
+                if (self.active_worker_id == "Single Environment" and 
+                    self.single_worker_choice.GetSelection() == wx.NOT_FOUND):
+                    self.single_worker_choice.SetSelection(0)
+        except Exception as e:
+            print(f"Error adding worker to dropdown: {e}")
+
     def update_race_plot_layout(self):
-        """Update race plot layout based on current workers"""
-        if self.active_worker_id == "All Environments":
-            worker_ids = list(self.race_visualizations.keys())
-            self.init_multi_race_plots(worker_ids)
-            # Redraw all current visualizations
-            for worker_id, race_state in self.race_visualizations.items():
-                self.draw_single_race_environment(worker_id, race_state)
-            self.race_canvas.draw()
+        """Update race plot layout based on current workers - optimized"""
+        try:
+            if self.active_worker_id == "All Environments":
+                worker_ids = list(self.race_visualizations.keys())
+                if len(worker_ids) != len(self.race_axes) or not all(w in self.race_axes for w in worker_ids):
+                    # Only rebuild layout if actually needed
+                    self.init_multi_race_plots(worker_ids)
+                    
+                    # Redraw all current visualizations
+                    for worker_id, race_state in self.race_visualizations.items():
+                        self.draw_single_race_environment(worker_id, race_state)
+                    
+                    self.race_canvas.draw_idle()
+        except Exception as e:
+            print(f"Error updating race plot layout: {e}")
     
     def on_worker_selected(self, event):
         """Handle display mode selection"""
@@ -665,91 +686,105 @@ class VisualizationPanel(wx.Panel):
         return worker_color_map[worker_id]
     
     def draw_single_race_environment(self, worker_id, race_state):
-        """Draw a single race environment on its designated axis"""
-        # Get the appropriate axis
-        if worker_id in self.race_axes:
-            ax = self.race_axes[worker_id]
-        elif 'default' in self.race_axes:
-            ax = self.race_axes['default']
-        else:
-            return
-        
-        # Clear the axis
-        ax.clear()
-        ax.set_title(f'Environment: {worker_id}')
-        ax.set_xlim(0, 16000)
-        ax.set_ylim(0, 9000)
-        ax.set_aspect('equal')
-        ax.grid(True)
-        
-        worker_colors = self.get_worker_colors(worker_id)
-        
-        # Draw checkpoints
-        if 'checkpoints' in race_state and race_state['checkpoints']:
-            checkpoints = race_state['checkpoints']
-            for i, (x, y) in enumerate(checkpoints):
-                ax.add_patch(
-                    matplotlib.patches.Circle((x, y), 600, fill=False, edgecolor='green', linewidth=2)
-                )
-                # Add checkpoint number
-                ax.text(x, y, str(i), fontsize=10, ha='center', va='center')
-        
-        # Draw pods
-        if 'pods' in race_state:
-            pods = race_state['pods']
+        """Draw a single race environment - optimized for recording/playback"""
+        try:
+            # Get the appropriate axis
+            if worker_id in self.race_axes:
+                ax = self.race_axes[worker_id]
+            elif 'default' in self.race_axes:
+                ax = self.race_axes['default']
+            else:
+                return
             
-            for i, pod in enumerate(pods):
-                if 'position' not in pod or len(pod['position']) < 2:
-                    continue  # Skip pods with invalid position data
+            # Only clear if we have new data
+            if not hasattr(ax, '_last_update_time') or time.time() - ax._last_update_time > 0.1:
+                ax.clear()
+                ax._last_update_time = time.time()
+            else:
+                # Just clear the artists instead of the whole axis
+                for artist in ax.patches + ax.lines + ax.texts:
+                    artist.remove()
+            
+            # Set up axis properties
+            ax.set_title(f'Environment: {worker_id}')
+            ax.set_xlim(0, 16000)
+            ax.set_ylim(0, 9000)
+            ax.set_aspect('equal')
+            ax.grid(True, alpha=0.3)  # Lighter grid for better performance
+            
+            worker_colors = self.get_worker_colors(worker_id)
+            
+            # Draw checkpoints efficiently
+            if 'checkpoints' in race_state and race_state['checkpoints']:
+                checkpoints = race_state['checkpoints']
+                for i, (x, y) in enumerate(checkpoints):
+                    circle = matplotlib.patches.Circle(
+                        (x, y), 600, fill=False, edgecolor='green', 
+                        linewidth=1.5, alpha=0.7
+                    )
+                    ax.add_patch(circle)
+                    # Add checkpoint number with smaller font
+                    ax.text(x, y, str(i), fontsize=8, ha='center', va='center', 
+                           color='darkgreen', weight='bold')
+            
+            # Draw pods efficiently
+            if 'pods' in race_state:
+                pods = race_state['pods']
+                
+                for i, pod in enumerate(pods):
+                    if 'position' not in pod or len(pod['position']) < 2:
+                        continue
+                        
+                    x, y = pod['position']
+                    angle = pod.get('angle', 0)
+                    color = worker_colors[i % len(worker_colors)]
                     
-                x, y = pod['position']
-                angle = pod.get('angle', 0)
-                color = worker_colors[i % len(worker_colors)]
+                    # Draw collision radius circle with reduced alpha
+                    collision_circle = matplotlib.patches.Circle(
+                        (x, y), 400, 
+                        fill=False, 
+                        edgecolor=color, 
+                        linestyle='--', 
+                        alpha=0.3,
+                        linewidth=1
+                    )
+                    ax.add_patch(collision_circle)
+                    
+                    # Draw pod as a triangle pointing in the direction of travel
+                    dx = 400 * np.cos(np.radians(angle))
+                    dy = 400 * np.sin(np.radians(angle))
+                    
+                    ax.arrow(
+                        x, y, dx, dy, 
+                        head_width=200, head_length=300, 
+                        fc=color, ec=color, alpha=0.8
+                    )
+                    
+                    # Add pod label with smaller font
+                    ax.text(x, y-600, f'P{i}', fontsize=7, ha='center', va='center', 
+                           color=color, weight='bold')
+                    
+                    # Add pod trail if available (limit trail length for performance)
+                    if 'trail' in pod and len(pod['trail']) > 1:
+                        trail = pod['trail'][-20:]  # Show last 20 points only
+                        if len(trail) > 1:
+                            trail_x, trail_y = zip(*trail)
+                            ax.plot(trail_x, trail_y, color=color, alpha=0.2, linewidth=1)
+            
+            # Add legend only for single environment view (performance optimization)
+            if len(self.race_axes) == 1 or self.active_worker_id == "Single Environment":
+                legend_elements = [
+                    matplotlib.patches.Patch(color='green', label='Checkpoints'),
+                    matplotlib.patches.Patch(color=worker_colors[0], label='Pod 0'),
+                    matplotlib.patches.Patch(color=worker_colors[1], label='Pod 1'),
+                    matplotlib.patches.Patch(color=worker_colors[2], label='Pod 2'),
+                    matplotlib.patches.Patch(color=worker_colors[3], label='Pod 3'),
+                ]
+                ax.legend(handles=legend_elements, loc='upper right', fontsize=6)
                 
-                # Draw collision radius circle (400 units)
-                collision_circle = matplotlib.patches.Circle(
-                    (x, y), 400, 
-                    fill=False, 
-                    edgecolor=color, 
-                    linestyle='--', 
-                    alpha=0.5,
-                    linewidth=1
-                )
-                ax.add_patch(collision_circle)
-                
-                # Draw pod as a triangle pointing in the direction of travel
-                dx = 400 * np.cos(np.radians(angle))
-                dy = 400 * np.sin(np.radians(angle))
-                
-                ax.arrow(
-                    x, y, dx, dy, 
-                    head_width=200, head_length=300, 
-                    fc=color, ec=color, alpha=0.7
-                )
-                
-                # Add pod label
-                ax.text(x, y-600, f'P{i}', fontsize=8, ha='center', va='center', 
-                       color=color, weight='bold')
-                
-                # Add pod trail if available
-                if 'trail' in pod and len(pod['trail']) > 1:
-                    trail = pod['trail'][-30:]  # Show last 30 points
-                    if len(trail) > 1:
-                        trail_x, trail_y = zip(*trail)
-                        ax.plot(trail_x, trail_y, color=color, alpha=0.3, linewidth=1)
-        
-        # Add legend for single environment view
-        if worker_id in self.race_axes or len(self.race_axes) == 1:
-            legend_elements = [
-                matplotlib.patches.Patch(color='green', label='Checkpoints (600 radius)'),
-                matplotlib.patches.Patch(color=worker_colors[0], label='Pod 0 (Player 0)'),
-                matplotlib.patches.Patch(color=worker_colors[1], label='Pod 1 (Player 0)'),
-                matplotlib.patches.Patch(color=worker_colors[2], label='Pod 2 (Player 1)'),
-                matplotlib.patches.Patch(color=worker_colors[3], label='Pod 3 (Player 1)'),
-                matplotlib.lines.Line2D([0], [0], linestyle='--', color='gray', alpha=0.5, label='Collision Radius (400)')
-            ]
-            ax.legend(handles=legend_elements, loc='upper right', fontsize=6)
-    
+        except Exception as e:
+            print(f"Error drawing race environment for {worker_id}: {e}")
+
     def update_single_worker_visualization(self, worker_id):
         """Update visualization for a single worker in single environment mode"""
         if worker_id not in self.race_visualizations:
@@ -775,22 +810,16 @@ class VisualizationPanel(wx.Panel):
             traceback.print_exc()
 
     def add_metric(self, metric_dict):
-        """Add a metric to the queue (called from training thread) - non-blocking"""
+        """Add a metric - now primarily handled by VisualizationConnector"""
         try:
-            # Use non-blocking put to prevent training thread from being blocked
+            # For direct metrics that bypass the connector, use the queue
             if not self.metrics_queue.full():
                 self.metrics_queue.put_nowait(metric_dict)
-            else:
-                # If queue is full, skip this metric to prevent blocking training
-                print("Visualization queue full, skipping metric update")
-                
         except queue.Full:
             # Queue is full, skip this update
             pass
         except Exception as e:
             print(f"Error in add_metric: {e}")
-            import traceback
-            traceback.print_exc()
 
     def load_training_data(self, model_dir):
         """Load training data from model directory"""
@@ -1037,7 +1066,9 @@ class VisualizationPanel(wx.Panel):
         log_files.extend(gpu_logs)
         
         if not log_files:
-            return None
+            # If no logs found, default to the latest iteration
+            wx.CallAfter(self.sim_results.AppendText, "No training logs found. Defaulting to latest iteration.\n")
+            return self.find_latest_iteration_model(model_files)
         
         # Parse logs to find best performing iterations
         best_iteration = None
@@ -1046,52 +1077,103 @@ class VisualizationPanel(wx.Panel):
         
         for log_file in log_files:
             try:
+                wx.CallAfter(self.sim_results.AppendText, f"Parsing log file: {log_file.name}\n")
                 with open(log_file, 'r') as f:
                     for line in f:
                         try:
                             parts = line.strip().split(',')
                             if len(parts) >= 2:
-                                iteration = int(parts[0].split('=')[1])
-                                reward = float(parts[1].split('=')[1])
+                                # Extract iteration number
+                                iter_part = [p for p in parts if p.startswith('iteration=')]
+                                if not iter_part:
+                                    continue
+                                iteration = int(iter_part[0].split('=')[1])
+                                
+                                # Extract reward - handle both old and new formats
+                                reward_part = [p for p in parts if p.startswith('reward=') or p.startswith('total_reward=')]
+                                if not reward_part:
+                                    continue
+                                reward = float(reward_part[0].split('=')[1])
                                 
                                 # Track the best reward and its iteration
                                 if reward > best_reward:
                                     best_reward = reward
                                     best_iteration = iteration
+                                    wx.CallAfter(self.sim_results.AppendText, 
+                                            f"New best: iteration {iteration}, reward {reward:.4f}\n")
                                 
                                 # Store all iteration rewards for averaging
                                 if iteration not in iteration_rewards:
                                     iteration_rewards[iteration] = []
                                 iteration_rewards[iteration].append(reward)
                                 
-                        except (ValueError, IndexError):
+                        except (ValueError, IndexError) as e:
                             continue
-            except Exception:
+            except Exception as e:
+                wx.CallAfter(self.sim_results.AppendText, f"Error parsing log {log_file.name}: {str(e)}\n")
                 continue
         
         # If we found a best iteration, look for corresponding model file
         if best_iteration is not None:
+            wx.CallAfter(self.sim_results.AppendText, f"Best iteration found: {best_iteration} with reward {best_reward:.4f}\n")
+            
+            # First try exact match
             for model_file in model_files:
                 if f'_iter{best_iteration}.' in str(model_file):
                     wx.CallAfter(self.sim_results.AppendText, 
-                               f"Selected best model: {model_file.name} (iteration {best_iteration}, reward {best_reward:.4f})\n")
+                            f"Selected best model: {model_file.name} (iteration {best_iteration}, reward {best_reward:.4f})\n")
                     return model_file
-        
-        # Alternative: find iteration with best average reward over multiple runs
-        if iteration_rewards:
-            avg_rewards = {iter_num: sum(rewards)/len(rewards) 
-                          for iter_num, rewards in iteration_rewards.items()}
-            best_avg_iteration = max(avg_rewards.keys(), key=lambda k: avg_rewards[k])
-            best_avg_reward = avg_rewards[best_avg_iteration]
             
-            for model_file in model_files:
-                if f'_iter{best_avg_iteration}.' in str(model_file):
-                    wx.CallAfter(self.sim_results.AppendText, 
-                               f"Selected best average model: {model_file.name} (iteration {best_avg_iteration}, avg reward {best_avg_reward:.4f})\n")
-                    return model_file
+            # If no exact match, find the closest iteration
+            closest_iter_file = self.find_closest_iteration_model(model_files, best_iteration)
+            if closest_iter_file:
+                wx.CallAfter(self.sim_results.AppendText, 
+                        f"Selected closest model to best iteration: {closest_iter_file.name}\n")
+                return closest_iter_file
         
-        return None
-    
+        # Fallback to latest iteration
+        wx.CallAfter(self.sim_results.AppendText, "No best model found from logs. Using latest iteration.\n")
+        return self.find_latest_iteration_model(model_files)
+
+    def find_closest_iteration_model(self, model_files, target_iteration):
+        """Find the model file with iteration closest to target_iteration"""
+        iter_files = []
+        for model_file in model_files:
+            try:
+                if '_iter' in str(model_file):
+                    iter_num = self.extract_iteration_number(model_file.name)
+                    iter_files.append((iter_num, model_file))
+            except (ValueError, IndexError):
+                continue
+        
+        if not iter_files:
+            return None
+        
+        # Sort by distance to target iteration
+        iter_files.sort(key=lambda x: abs(x[0] - target_iteration))
+        return iter_files[0][1]
+
+    def find_latest_iteration_model(self, model_files):
+        """Find the model file with the highest iteration number"""
+        iter_files = []
+        for model_file in model_files:
+            try:
+                if '_iter' in str(model_file):
+                    iter_num = self.extract_iteration_number(model_file.name)
+                    iter_files.append((iter_num, model_file))
+            except (ValueError, IndexError):
+                continue
+        
+        if not iter_files:
+            # If no iteration files, return the first model file
+            return model_files[0] if model_files else None
+        
+        # Sort by iteration number (descending)
+        iter_files.sort(key=lambda x: x[0], reverse=True)
+        wx.CallAfter(self.sim_results.AppendText, 
+                f"Selected latest model: {iter_files[0][1].name} (iteration {iter_files[0][0]})\n")
+        return iter_files[0][1]
+
     def on_visualize_race(self, event):
         """Start race visualization"""
         model_dir = self.model_dir_ctrl.GetValue()
@@ -1156,6 +1238,9 @@ class VisualizationPanel(wx.Panel):
             
             # Reset environment to get initial observations
             observations = env.reset()
+            
+            # Debug: Print initial observation keys
+            wx.CallAfter(self.sim_results.AppendText, f"Initial observation keys: {list(observations.keys())}\n")
             
             # Get observation dimension from the environment
             obs_dim = next(iter(observations.values())).shape[1]
@@ -1273,6 +1358,9 @@ class VisualizationPanel(wx.Panel):
                     # Use default network
                     pod_networks[pod_key] = PodNetwork(observation_dim=obs_dim).to('cpu')
             
+            # Debug: Print loaded pod networks
+            wx.CallAfter(self.sim_results.AppendText, f"Loaded pod networks for keys: {list(pod_networks.keys())}\n")
+            
             # Get checkpoint positions from environment
             checkpoints = env.get_checkpoints()
             
@@ -1301,15 +1389,74 @@ class VisualizationPanel(wx.Panel):
                 # Get actions from all pod networks
                 actions = {}
                 with torch.no_grad():
+                    # Debug: Print observation keys at each step
+                    if step > 0:  # Only print for steps near the error
+                        wx.CallAfter(self.sim_results.AppendText, f"Step {step} observation keys: {list(observations.keys())}\n")
+                    
                     for pod_key, network in pod_networks.items():
                         # Get deterministic action from network
                         if pod_key in observations:
                             obs = observations[pod_key]
                             action = network.get_actions(obs, deterministic=True)
                             actions[pod_key] = action
+                        elif step > 0:  # Debug near error
+                            wx.CallAfter(self.sim_results.AppendText, f"Step {step}: Missing observation for {pod_key}\n")
+                
+                # Debug: Print action keys
+                if step > 0:
+                    wx.CallAfter(self.sim_results.AppendText, f"Step {step} action keys: {list(actions.keys())}\n")
                 
                 # Step the environment
-                observations, rewards, done, info = env.step(actions)
+                try:
+                    observations, rewards, done, info = env.step(actions)
+                    
+                    # Debug: Print info after step
+                    if step > 0:
+                        wx.CallAfter(self.sim_results.AppendText, f"Step {step} info keys: {list(info.keys())}\n")
+                        if "checkpoint_progress" in info:
+                            wx.CallAfter(self.sim_results.AppendText, f"Step {step} checkpoint_progress shape: {info['checkpoint_progress'].shape}\n")
+                    
+                except KeyError as e:
+                    wx.CallAfter(self.sim_results.AppendText, f"Error during step {step}: KeyError {str(e)}\n")
+                    wx.CallAfter(self.sim_results.AppendText, f"Available action keys: {list(actions.keys())}\n")
+                    wx.CallAfter(self.sim_results.AppendText, f"Available observation keys: {list(observations.keys())}\n")
+                    wx.CallAfter(self.sim_results.AppendText, "Continuing with visualization...\n")
+                    
+                    # FIX: Create a fallback visualization using current pod states
+                    pod_states = env.get_pod_states()
+                    race_state['pods'] = []
+                    for pod_idx, pod_state in enumerate(pod_states):
+                        pod_key = f"player{pod_idx//2}_pod{pod_idx%2}"
+                        if pod_key in pod_networks:
+                            position = pod_state['position']
+                            pod_trails[pod_key].append(position)
+                            pod_info = {
+                                'position': position,
+                                'angle': pod_state['angle'],
+                                'trail': pod_trails[pod_key]
+                            }
+                            race_state['pods'].append(pod_info)
+                    wx.CallAfter(self.update_race_visualization_throttled, race_state, 'visualization')
+                    continue
+                except ValueError as e:
+                    wx.CallAfter(self.sim_results.AppendText, f"Error during step {step}: ValueError {str(e)}\n")
+                    wx.CallAfter(self.sim_results.AppendText, "Continuing with visualization...\n")
+                    # FIX: Create a fallback visualization using current pod states
+                    pod_states = env.get_pod_states()
+                    race_state['pods'] = []
+                    for pod_idx, pod_state in enumerate(pod_states):
+                        pod_key = f"player{pod_idx//2}_pod{pod_idx%2}"
+                        if pod_key in pod_networks:
+                            position = pod_state['position']
+                            pod_trails[pod_key].append(position)
+                            pod_info = {
+                                'position': position,
+                                'angle': pod_state['angle'],
+                                'trail': pod_trails[pod_key]
+                            }
+                            race_state['pods'].append(pod_info)
+                    wx.CallAfter(self.update_race_visualization_throttled, race_state, 'visualization')
+                    continue
                 
                 # Update pod trails using actual pod states instead of observations
                 pod_states = env.get_pod_states()

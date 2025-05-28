@@ -148,6 +148,10 @@ class OptimizedRaceEnvironment:
         self.last_checkpoint_turn.zero_()
         self.done.zero_()
         
+        # Regenerate tracks if randomization is enabled
+        if self.randomize_checkpoints:
+            self._generate_tracks()
+        
         # Reset pods
         for pod_idx, pod in enumerate(self.pods):
             # Reset pod state
@@ -183,6 +187,11 @@ class OptimizedRaceEnvironment:
             
             # Set pod angle towards next checkpoint (vectorized)
             pod.angle = pod.angle_to(next_cp)
+        
+        # Debug race parameters
+        if self.batch_size > 0:
+            print(f"Race reset: num_checkpoints={self.batch_checkpoint_counts[0].item()}, " +
+                f"laps={self.laps}, total_checkpoints={self.batch_checkpoint_counts[0].item() * self.laps}")
         
         return self._get_observations()
     
@@ -468,13 +477,7 @@ class OptimizedRaceEnvironment:
     
     def step(self, actions: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """
-        Execute one step in the environment - UPDATED to accept 4-output format from model
-        
-        Actions format: Dict[str, torch.Tensor] where each tensor has shape [batch_size, 4]
-        - action[:, 0] = angle adjustment [-1, 1]
-        - action[:, 1] = thrust [0, 1]
-        - action[:, 2] = shield probability [0, 1]
-        - action[:, 3] = boost probability [0, 1]
+        Execute one step in the environment - SIMPLIFIED thrust application
         """
         # Increment turn counter
         self.turn_count += 1
@@ -486,99 +489,95 @@ class OptimizedRaceEnvironment:
             pod_key = f"player{player_idx}_pod{team_pod_idx}"
             
             if pod_key in actions:
-                action = actions[pod_key].to(self.device)  # Ensure action is on environment's device
+                action = actions[pod_key].to(self.device)
                 
                 # Validate action format
                 if action.shape[1] != 4:
                     raise ValueError(f"Invalid action shape: {action.shape}. Expected [batch_size, 4]")
                 
                 # Extract action components
-                angle_target = action[:, 0].unsqueeze(1)  # [-1, 1]
-                thrust_value = action[:, 1].unsqueeze(1)  # [0, 1]
-                shield_prob = action[:, 2].unsqueeze(1)   # [0, 1]
-                boost_prob = action[:, 3].unsqueeze(1)    # [0, 1]
+                angle_target = action[:, 0]      # [-1, 1]
+                thrust_value = action[:, 1]      # [0, 1]
+                shield_prob = action[:, 2]       # [0, 1]
+                boost_prob = action[:, 3]        # [0, 1]
+
+                # Store thrust value for runner reward calculation
+                if team_pod_idx == 0:
+                    # Fix: Use an instance variable instead of accessing by index
+                    self._last_runner_thrust = thrust_value * 100.0
                 
-                # Determine action type based on probabilities
-                shield_mask = shield_prob > 0.5
-                boost_mask = (boost_prob > 0.5) & pod.boost_available.bool().unsqueeze(1)
-                normal_thrust_mask = ~(shield_mask | boost_mask)
-                
-                # Get next checkpoint position using batch-specific counts
+                # Get next checkpoint position
                 next_cp_positions = torch.zeros(self.batch_size, 2, device=self.device)
                 for b in range(self.batch_size):
                     num_cp = self.batch_checkpoint_counts[b].item()
                     next_cp_idx = pod.current_checkpoint[b] % num_cp
-                    # Ensure the index is within bounds
                     next_cp_idx = min(next_cp_idx.item(), num_cp - 1)
                     next_cp_positions[b] = self.checkpoints[b, next_cp_idx]
                 
                 # Calculate target angle
                 base_angle = pod.angle_to(next_cp_positions)
-                # Convert normalized angle_target [-1, 1] to degree adjustment [-18, 18]
-                angle_adjustment = angle_target * 18.0
-                target_angle = base_angle + angle_adjustment
+                angle_adjustment = angle_target * 18.0  # [-18, 18] degrees
+                target_angle = base_angle + angle_adjustment.unsqueeze(1)
                 
                 # Rotate pod
                 pod.rotate(target_angle)
                 
-                # Apply actions based on determined masks
-                # Apply shield
+                # SIMPLIFIED: Apply actions in priority order
+                # 1. Shield (highest priority)
+                shield_mask = shield_prob > 0.5
                 if shield_mask.any():
-                    shield_indices = shield_mask.squeeze(-1)
-                    if shield_indices.any():
-                        pod.apply_shield_selective(shield_indices)
+                    pod.apply_shield_selective(shield_mask)
                 
-                # Apply boost
+                # 2. Boost (if shield not active and boost available)
+                boost_mask = (boost_prob > 0.5) & pod.boost_available.squeeze(-1).bool() & ~shield_mask
                 if boost_mask.any():
-                    boost_indices = boost_mask.squeeze(-1)
-                    if boost_indices.any():
-                        pod.apply_boost_selective(boost_indices)
+                    pod.apply_boost_selective(boost_mask)
                 
-                # Apply normal thrust
-                if normal_thrust_mask.any():
-                    # Check shield cooldown - pods can't thrust while shield is cooling down
-                    can_thrust_mask = pod.shield_cooldown == 0
-                    normal_thrust_mask_squeezed = normal_thrust_mask.squeeze(-1)
-                    can_thrust_mask_squeezed = can_thrust_mask.squeeze(-1)
-                    final_thrust_mask = normal_thrust_mask_squeezed & can_thrust_mask_squeezed
-
-                    if final_thrust_mask.any():
-                        # Convert normalized thrust [0, 1] to game thrust [0, 100]
-                        thrust_to_apply = torch.zeros(self.batch_size, 1, device=self.device)
-                        
-                        # FIX: Use direct indexing instead of torch.where to avoid broadcasting issues
-                        # Get indices where thrust should be applied
-                        thrust_indices = torch.where(final_thrust_mask)[0]
-                        
-                        if len(thrust_indices) > 0:
-                            # Apply thrust only to the selected indices
-                            thrust_values_to_apply = thrust_value[thrust_indices] * 100.0
-                            thrust_to_apply[thrust_indices] = thrust_values_to_apply
-                        
-                        pod.apply_thrust(thrust_to_apply)
-                        
+                # 3. Normal thrust (if neither shield nor boost, and shield not cooling down)
+                can_thrust = (pod.shield_cooldown.squeeze(-1) == 0) & ~shield_mask & ~boost_mask
+                if can_thrust.any():
+                    # Convert normalized thrust [0, 1] to game thrust [0, 100]
+                    thrust_amount = thrust_value * 100.0
+                    pod.apply_thrust_selective(thrust_amount, can_thrust)
+        
         # Move pods and handle collisions
         self._simulate_movement()
         
         # Check for checkpoints
         self._check_checkpoints()
         
-        # Check for race completion (REMOVED timeout-based termination)
+        # Check for race completion
         self._update_race_status()
         
         # Get observations, rewards, and done status
         observations = self._get_observations()
-        rewards = self._calculate_rewards()
+        
+        # Fix: Calculate rewards with proper error handling
+        try:
+            rewards = self._calculate_rewards()
+        except KeyError as e:
+            # Handle missing key error in reward calculation
+            print(f"Warning: KeyError {e} in reward calculation. Using zero rewards.")
+            rewards = {}
+            for pod_key in observations.keys():
+                rewards[pod_key] = torch.zeros(self.batch_size, 1, device=self.device)
         
         # Additional info
         info = {
             "turn_count": self.turn_count,
             "checkpoint_progress": torch.stack([pod.current_checkpoint for pod in self.pods]),
-            "timeout_penalties": self._get_timeout_penalties(),  # Add timeout info for debugging
+            "timeout_penalties": self._get_timeout_penalties(),
+            "race_completed": self.done,  # Add race completion status to info
         }
         
+        # Debug step info for first batch
+        if self.batch_size > 0 and self.turn_count[0].item() % 10 == 0:  # Every 10 steps
+            print(f"Step {self.turn_count[0].item()}: " +
+                f"done={self.done[0].item()}, " +
+                ", ".join([f"pod{i}_cp={self.pods[i].current_checkpoint[0].item()}" for i in range(4)]))
+        
         return observations, rewards, self.done, info
-    
+
     def _simulate_movement(self) -> None:
         """Simulate pod movement with proper collision detection and bounce mechanics"""
         # First, move all pods (this calls their move() method)
@@ -670,10 +669,13 @@ class OptimizedRaceEnvironment:
         pod_j.velocity[collision_indices] = vel_j_new
     
     def _check_checkpoints(self) -> None:
-        """Optimized checkpoint checking - updated for variable checkpoint counts"""
+        """Optimized checkpoint checking - updated for variable checkpoint counts and race completion"""
         for pod_idx, pod in enumerate(self.pods):
             # Get batch-specific next checkpoint positions
             next_cp_positions = torch.zeros(self.batch_size, 2, device=self.device)
+            
+            # Calculate total checkpoints needed to complete the race
+            batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
             
             for b in range(self.batch_size):
                 num_cp = self.batch_checkpoint_counts[b].item()
@@ -682,53 +684,57 @@ class OptimizedRaceEnvironment:
                 # Only check checkpoints if race isn't finished for this pod
                 if pod.current_checkpoint[b] < total_cp:
                     next_cp_idx = pod.current_checkpoint[b] % num_cp
+                    # Ensure next_cp_idx is within bounds
+                    next_cp_idx = min(int(next_cp_idx.item()), num_cp - 1)
                     next_cp_positions[b] = self.checkpoints[b, next_cp_idx]
                 else:
                     # Race finished, set dummy position (won't be used)
                     next_cp_positions[b] = self.checkpoints[b, 0]
+                    # Debug race completion
+                    if pod_idx == 0 and b == 0:  # Only for first pod and batch
+                        print(f"Race completed for pod {pod_idx}, batch {b}: " +
+                            f"current_cp={pod.current_checkpoint[b].item()}, total_cp={total_cp}")
             
             # Check distances to next checkpoints only for unfinished races
             diff = pod.position - next_cp_positions
             distances = torch.norm(diff, dim=1)
             
             # Create mask for pods that haven't finished the race
-            batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
             not_finished = pod.current_checkpoint.squeeze() < batch_total_checkpoints
             
             # Only check checkpoint collision for unfinished pods
-            reached = (distances <= 600) & not_finished  # Checkpoint radius
+            reached = (distances < 500) & not_finished  # Checkpoint radius
             
             # Update checkpoint counters and last checkpoint turn
             if reached.any():
                 pod.current_checkpoint[reached] += 1
                 self.last_checkpoint_turn[reached, pod_idx] = self.turn_count[reached].squeeze()
-
-    def _get_next_checkpoint_positions(self) -> Dict[int, torch.Tensor]:
-        """Get next checkpoint positions for all pods"""
-        next_cp_positions = {}
-        
-        for pod_idx, pod in enumerate(self.pods):
-            # Get batch-specific next checkpoint positions
-            positions = torch.zeros(self.batch_size, 2, device=self.device)
-            
-            for b in range(self.batch_size):
-                num_cp = self.batch_checkpoint_counts[b].item()
-                next_cp_idx = pod.current_checkpoint[b] % num_cp
-                # Ensure the index is within bounds
-                next_cp_idx = min(next_cp_idx, num_cp - 1)
-                positions[b] = self.checkpoints[b, next_cp_idx]
-            
-            next_cp_positions[pod_idx] = positions
-        
-        return next_cp_positions
+                
+                # Debug checkpoint reached
+                for b in range(self.batch_size):
+                    if reached[b] and b == 0:  # Only for first batch
+                        print(f"Pod {pod_idx} reached checkpoint: now at {pod.current_checkpoint[b].item()}")
+                
+                # Check if race is now completed after updating checkpoint
+                newly_finished = pod.current_checkpoint.squeeze() >= batch_total_checkpoints
+                if newly_finished.any():
+                    for b in range(self.batch_size):
+                        if newly_finished[b] and b == 0:  # Only for first batch
+                            print(f"Pod {pod_idx} just completed race: {pod.current_checkpoint[b].item()} >= {batch_total_checkpoints[b].item()}")
 
     def _update_race_status(self) -> None:
-        """Update race status - MODIFIED to only end on race completion, not timeout"""
+        """Update race status - MODIFIED to properly detect race completion"""
         new_done = torch.zeros_like(self.done)
         
         # Calculate total checkpoints per batch 
-        # We need to complete all laps AND cross the finish line (checkpoint 0) one final time
+        # For a race with num_cp checkpoints and laps laps, the total is num_cp * laps
         batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
+        
+        # Debug race status
+        if self.batch_size > 0:
+            print(f"Race status: turn={self.turn_count[0].item()}, " +
+                ", ".join([f"pod{i}_cp={self.pods[i].current_checkpoint[0].item()}" for i in range(4)]) +
+                f", total_cp={batch_total_checkpoints[0].item()}")
         
         # Check if any pod has completed all checkpoints
         for player_idx in range(2):
@@ -737,16 +743,24 @@ class OptimizedRaceEnvironment:
             for pod_idx_in_team, pod in enumerate(player_pods):
                 global_pod_idx = player_idx * 2 + pod_idx_in_team
                 
-                # Check if pod has completed all checkpoints including final finish line crossing
-                # For 3 CP, 3 laps: need to reach checkpoint 9 (3*3 = 9 total checkpoints)
-                # print(f"Pod {global_pod_idx} current checkpoint: {pod.current_checkpoint.squeeze().item()}, total checkpoints: {batch_total_checkpoints[0].item()}")
+                # Check if pod has completed all checkpoints
+                # For 4 CP, 3 laps: need to reach checkpoint 12 (4*3 = 12 total checkpoints)
                 race_completed = pod.current_checkpoint.squeeze() >= batch_total_checkpoints
+                
+                # Debug completion check for first batch
+                if self.batch_size > 0 and race_completed[0]:
+                    print(f"Pod {global_pod_idx} completed race: current_cp={pod.current_checkpoint[0].item()}, " +
+                        f"required={batch_total_checkpoints[0].item()}")
+                
+                # Mark as done if race is completed
                 new_done = new_done | race_completed
         
-        # REMOVED: Timeout-based episode termination
-        # Episodes now only end when race is actually completed
-        
+        # Update done status
         self.done = new_done
+        
+        # Debug done status
+        if self.batch_size > 0:
+            print(f"Done status: {self.done[0].item()}")
             
     def _get_timeout_penalties(self) -> Dict[int, torch.Tensor]:
         """Get timeout penalties for each pod (for debugging/info)"""
@@ -768,208 +782,473 @@ class OptimizedRaceEnvironment:
         rewards = {}
         self._last_reward_breakdown = {}
         
-        # Pre-compute positions and states
-        next_cp_positions = self._get_next_checkpoint_positions()
-        
-        for pod_idx, pod in enumerate(self.pods):
-            player_idx = pod_idx // 2
-            team_pod_idx = pod_idx % 2
-            pod_key = f"player{player_idx}_pod{team_pod_idx}"
+        try:
+            # Pre-compute positions and states
+            next_cp_positions = self._get_next_checkpoint_positions()
             
-            if team_pod_idx == 0:  # Runner pod
-                rewards[pod_key] = self._calculate_runner_reward(pod_idx, pod, next_cp_positions)
-                # Store breakdown for debugging
-                self._last_reward_breakdown[pod_key] = {
-                    'type': 'runner',
-                    'checkpoint_progress': float(pod.current_checkpoint[0]),
-                    'total_reward': float(rewards[pod_key][0])
-                }
-            else:  # Blocker pod
-                rewards[pod_key] = self._calculate_blocker_reward(pod_idx, pod, next_cp_positions)
-                # Store breakdown for debugging
-                self._last_reward_breakdown[pod_key] = {
-                    'type': 'blocker', 
-                    'checkpoint_progress': float(pod.current_checkpoint[0]),
-                    'total_reward': float(rewards[pod_key][0])
-                }
+            # Ensure all pod indices are in next_cp_positions
+            for pod_idx, pod in enumerate(self.pods):
+                if pod_idx not in next_cp_positions:
+                    # If missing, add default position (first checkpoint)
+                    default_positions = torch.zeros(self.batch_size, 2, device=self.device)
+                    for b in range(self.batch_size):
+                        default_positions[b] = self.checkpoints[b, 0]
+                    next_cp_positions[pod_idx] = default_positions
+                    print(f"Warning: Added missing next_cp_position for pod {pod_idx}")
+            
+            for pod_idx, pod in enumerate(self.pods):
+                try:
+                    player_idx = pod_idx // 2
+                    team_pod_idx = pod_idx % 2
+                    pod_key = f"player{player_idx}_pod{team_pod_idx}"
+                    
+                    if team_pod_idx == 0:  # Runner pod
+                        try:
+                            rewards[pod_key] = self._calculate_runner_reward(pod_idx, pod, next_cp_positions)
+                            # FIX: Store breakdown for debugging - only use first batch item
+                            self._last_reward_breakdown[pod_key] = {
+                                'type': 'runner',
+                                'checkpoint_progress': float(pod.current_checkpoint[0, 0].item()),
+                                'total_reward': float(rewards[pod_key][0, 0].item())
+                            }
+                        except Exception as e:
+                            print(f"Error in _calculate_runner_reward for pod {pod_idx}: {str(e)}")
+                            import traceback
+                            traceback.print_exc()
+                            rewards[pod_key] = torch.zeros(self.batch_size, 1, device=self.device)
+                    else:  # Blocker pod
+                        try:
+                            rewards[pod_key] = self._calculate_blocker_reward(pod_idx, pod, next_cp_positions)
+                            # FIX: Store breakdown for debugging - only use first batch item
+                            self._last_reward_breakdown[pod_key] = {
+                                'type': 'blocker', 
+                                'checkpoint_progress': float(pod.current_checkpoint[0, 0].item()),
+                                'total_reward': float(rewards[pod_key][0, 0].item())
+                            }
+                        except Exception as e:
+                            print(f"Error in _calculate_blocker_reward for pod {pod_idx}: {str(e)}")
+                            import traceback
+                            traceback.print_exc()
+                            rewards[pod_key] = torch.zeros(self.batch_size, 1, device=self.device)
+                except Exception as e:
+                    print(f"Error processing rewards for pod {pod_idx}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    # Create default reward for this pod
+                    player_idx = pod_idx // 2
+                    team_pod_idx = pod_idx % 2
+                    pod_key = f"player{player_idx}_pod{team_pod_idx}"
+                    rewards[pod_key] = torch.zeros(self.batch_size, 1, device=self.device)
+        except Exception as e:
+            # Handle any exception by providing default rewards and logging the error
+            print(f"Error in _calculate_rewards: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            for pod_idx in range(4):
+                player_idx = pod_idx // 2
+                team_pod_idx = pod_idx % 2
+                pod_key = f"player{player_idx}_pod{team_pod_idx}"
+                rewards[pod_key] = torch.zeros(self.batch_size, 1, device=self.device)
         
         return rewards
 
-    def _calculate_timeout_penalty(self, pod_idx):
-        """Calculate timeout penalty for a specific pod"""
-        turns_since_checkpoint = self.turn_count - self.last_checkpoint_turn[:, pod_idx].unsqueeze(1)
-        
-        # Progressive penalty that increases with time since last checkpoint
-        timeout_progress = turns_since_checkpoint.float() / MAX_TURNS_WITHOUT_CHECKPOINT
-        
-        # Exponential penalty - gets severe after threshold
-        penalty = torch.where(
-            timeout_progress > 1.0,
-            torch.exp(timeout_progress - 1.0) - 1.0,  # Exponential penalty after threshold
-            timeout_progress ** 2 * 0.1  # Quadratic penalty before threshold
-        )
-        
-        return -penalty * self.timeout_penalty_weight
-
     def _calculate_runner_reward(self, pod_idx, pod, next_cp_positions):
-        """Reward runner for racing performance - UPDATED with timeout penalty"""
-        # Checkpoint progress reward (normalized)
-        batch_total_checkpoints = (self.batch_checkpoint_counts * self.laps).float().unsqueeze(1)
-        checkpoint_reward = pod.current_checkpoint.float() / batch_total_checkpoints
+        """Reward runner for racing performance with emphasis on speed and completion"""
+        try:
+            # Checkpoint progress reward (normalized)
+            batch_total_checkpoints = (self.batch_checkpoint_counts * self.laps).float().unsqueeze(1)
+            checkpoint_reward = pod.current_checkpoint.float() / batch_total_checkpoints
+            
+            # Significant bonus for each checkpoint reached
+            checkpoint_reached = (pod.current_checkpoint > 0) & (pod.current_checkpoint <= batch_total_checkpoints)
+            checkpoint_bonus = torch.zeros_like(checkpoint_reward)
+            if checkpoint_reached.any():
+                # Get previous checkpoint count to detect new checkpoints
+                prev_checkpoint = getattr(self, '_prev_checkpoint', torch.zeros_like(pod.current_checkpoint))
+                new_checkpoint = pod.current_checkpoint > prev_checkpoint
+                checkpoint_bonus[new_checkpoint] += 0.5  # Significant bonus for each new checkpoint
+            
+            # Store current checkpoint for next comparison
+            self._prev_checkpoint = pod.current_checkpoint.clone()
+            
+            # Lap completion bonus
+            lap_progress = pod.current_checkpoint.float() / self.batch_checkpoint_counts.unsqueeze(1)
+            completed_laps = torch.floor(lap_progress)
+            lap_bonus = completed_laps * 1.0  # Major bonus for each completed lap
+            
+            # Distance to next checkpoint (more significant weight)
+            if pod_idx not in next_cp_positions:
+                print(f"Warning: pod_idx {pod_idx} not in next_cp_positions. Keys: {list(next_cp_positions.keys())}")
+                # Create default position
+                diff = torch.zeros_like(pod.position)
+                distances = torch.ones(self.batch_size, 1, device=self.device) * 5000.0  # Default large distance
+            else:
+                diff = pod.position - next_cp_positions[pod_idx]
+                distances = torch.norm(diff, dim=1, keepdim=True)
+            
+            distance_reward = torch.clamp(1.0 - distances / 5000.0, 0.0, 1.0)
+            
+            # Speed towards checkpoint (more significant weight)
+            if pod_idx not in next_cp_positions:
+                direction_to_checkpoint = torch.zeros_like(pod.position)
+                velocity_alignment = torch.zeros(self.batch_size, 1, device=self.device)
+            else:
+                direction_to_checkpoint = next_cp_positions[pod_idx] - pod.position
+                direction_norm = torch.norm(direction_to_checkpoint, dim=1, keepdim=True)
+                direction_norm = torch.where(direction_norm > 0, direction_norm, torch.ones_like(direction_norm))
+                normalized_direction = direction_to_checkpoint / direction_norm
+                velocity_alignment = torch.sum(normalized_direction * pod.velocity, dim=1, keepdim=True)
+            
+            velocity_reward = torch.clamp(velocity_alignment / 500.0, -1.0, 1.0)
+            
+            # Base speed reward (encourage maintaining high speed)
+            speed_magnitude = torch.norm(pod.velocity, dim=1, keepdim=True)
+            
+            # MODIFIED: Stronger speed reward with exponential scaling to encourage high speeds
+            # Penalize speeds below 300, reward speeds above 300
+            speed_reward = torch.where(
+                speed_magnitude < 300.0,
+                torch.clamp(speed_magnitude / 300.0, 0.0, 1.0) * 0.5 - 0.5,  # Penalty for low speed
+                torch.clamp((speed_magnitude - 300.0) / 300.0, 0.0, 1.0) * 0.5  # Reward for high speed
+            )
+            
+            # Thrust usage reward - SIGNIFICANTLY INCREASED
+            # This requires tracking the last action, so we'll need to store it
+            thrust_reward = torch.zeros_like(speed_reward)
+            if hasattr(self, '_last_runner_thrust'):
+                # MODIFIED: Strongly reward high thrust and penalize low thrust
+                normalized_thrust = self._last_runner_thrust / 100.0
+                thrust_reward = torch.where(
+                    normalized_thrust < 0.7,  # Threshold at 70% thrust
+                    normalized_thrust * 0.2 - 0.5,  # Penalty for low thrust
+                    normalized_thrust * 0.5  # Reward for high thrust
+                )
+                # Ensure thrust_reward has the right shape
+                if thrust_reward.dim() == 1:
+                    thrust_reward = thrust_reward.unsqueeze(1)
+            
+            # ADDED: Timeout penalty to discourage stalling
+            timeout_penalty = self._calculate_timeout_penalty(pod_idx)
+            
+            # REBALANCED: More immediate rewards, stronger emphasis on speed and thrust
+            total_reward = (
+                checkpoint_reward * 0.5 +        # Base progress
+                checkpoint_bonus +               # Bonus for each checkpoint
+                lap_bonus +                      # Major bonus for lap completion
+                distance_reward * 0.3 +          # Approaching checkpoint
+                velocity_reward * 0.3 +          # Moving toward checkpoint
+                speed_reward * 0.6 +             # INCREASED: Maintaining speed
+                thrust_reward * 0.8 +            # INCREASED: Using thrust effectively
+                timeout_penalty * 1.5            # Stronger penalty for stalling
+            )
+            
+            # Debug info - FIX: Only print for first pod and first batch item
+            if pod_idx == 0 and self.batch_size > 0:
+                # Only access the first element of each tensor for printing
+                # Make sure to handle different tensor dimensions properly
+                print(f"Runner reward components: checkpoint={checkpoint_reward[0, 0].item():.3f}, "
+                    f"bonus={checkpoint_bonus[0, 0].item():.3f}, lap={lap_bonus[0, 0].item():.3f}, "
+                    f"dist={distance_reward[0, 0].item():.3f}, vel={velocity_reward[0, 0].item():.3f}, "
+                    f"speed={speed_reward[0, 0].item():.3f}, thrust={thrust_reward[0].item() if thrust_reward.dim() == 1 else thrust_reward[0, 0].item():.3f}, "
+                    f"timeout={timeout_penalty[0, 0].item():.3f}, "
+                    f"total={total_reward[0, 0].item():.3f}")
+            
+            return total_reward
         
-        # Distance to next checkpoint (more significant weight)
-        diff = pod.position - next_cp_positions[pod_idx]
-        distances = torch.norm(diff, dim=1, keepdim=True)
-        distance_reward = torch.clamp(1.0 - distances / 5000.0, 0.0, 1.0)
-        
-        # Speed towards checkpoint (more significant weight)
-        direction_to_checkpoint = next_cp_positions[pod_idx] - pod.position
-        direction_norm = torch.norm(direction_to_checkpoint, dim=1, keepdim=True)
-        direction_norm = torch.where(direction_norm > 0, direction_norm, torch.ones_like(direction_norm))
-        normalized_direction = direction_to_checkpoint / direction_norm
-        velocity_alignment = torch.sum(normalized_direction * pod.velocity, dim=1, keepdim=True)
-        velocity_reward = torch.clamp(velocity_alignment / 500.0, -1.0, 1.0)
-        
-        # Base speed reward (encourage maintaining speed)
-        speed_magnitude = torch.norm(pod.velocity, dim=1, keepdim=True)
-        speed_reward = torch.clamp(speed_magnitude / 600.0, 0.0, 1.0)
-        
-        # Penalty for being far from optimal racing line
-        optimal_position_reward = distance_reward  # Reuse distance calculation
-        
-        # ADDED: Timeout penalty to discourage stalling
-        timeout_penalty = self._calculate_timeout_penalty(pod_idx)
-        
-        # REBALANCED: More immediate rewards, less dependence on checkpoint progress
-        total_reward = (
-            checkpoint_reward * 1.0 +        # Reduced from 2.0
-            distance_reward * 0.3 +          # Increased from 0.02  
-            velocity_reward * 0.2 +          # Increased from 0.01
-            speed_reward * 0.1 +             # New: encourage speed
-            optimal_position_reward * 0.1 +  # New: encourage good positioning
-            timeout_penalty                  # NEW: penalize stalling
-        )
-        
-        return total_reward
+        except Exception as e:
+            print(f"Error in _calculate_runner_reward: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Return zero rewards as fallback
+            return torch.zeros(self.batch_size, 1, device=self.device)
 
     def _calculate_blocker_reward(self, pod_idx, pod, next_cp_positions):
-        """Reward blocker for blocking and supporting runner - UPDATED with timeout penalty"""
-        player_idx = pod_idx // 2
-        opponent_player_idx = 1 - player_idx
-        runner_idx = player_idx * 2  # Teammate runner
+        """Reward blocker for effective blocking while maintaining movement"""
+        try:
+            player_idx = pod_idx // 2
+            opponent_player_idx = 1 - player_idx
+            runner_idx = player_idx * 2  # Teammate runner
+            
+            # Base progress reward (reduced importance)
+            batch_total_checkpoints = (self.batch_checkpoint_counts * self.laps).float().unsqueeze(1)
+            checkpoint_reward = pod.current_checkpoint.float() / batch_total_checkpoints
+            
+            # Blocking rewards - emphasize active blocking
+            try:
+                blocking_reward = self._calculate_blocking_reward(pod_idx, opponent_player_idx)
+            except Exception as e:
+                print(f"Error in _calculate_blocking_reward: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                blocking_reward = torch.zeros(self.batch_size, 1, device=self.device)
+            
+            # Support runner reward - coordinate with runner
+            try:
+                support_reward = self._calculate_support_reward(pod_idx, runner_idx)
+            except Exception as e:
+                print(f"Error in _calculate_support_reward: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                support_reward = torch.zeros(self.batch_size, 1, device=self.device)
+            
+            # MODIFIED: Strongly encourage movement - heavily penalize standing still
+            speed_magnitude = torch.norm(pod.velocity, dim=1, keepdim=True)
+            movement_reward = torch.where(
+                speed_magnitude < 100.0,  # Threshold for "stationary"
+                -1.0 + speed_magnitude / 100.0,  # Severe penalty for being stationary
+                torch.clamp(speed_magnitude / 400.0, 0.0, 1.0) * 0.5  # Reward for movement
+            )
+            
+            # ADDED: Timeout penalty to discourage excessive shielding/stalling
+            try:
+                timeout_penalty = self._calculate_timeout_penalty(pod_idx) * 2.0  # Stronger penalty
+            except Exception as e:
+                print(f"Error in _calculate_timeout_penalty: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                timeout_penalty = torch.zeros(self.batch_size, 1, device=self.device)
+            
+            # ADDED: Anti-shield spam penalty
+            try:
+                shield_spam_penalty = self._calculate_shield_spam_penalty(pod_idx) * 2.0  # Stronger penalty
+            except Exception as e:
+                print(f"Error in _calculate_shield_spam_penalty: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                shield_spam_penalty = torch.zeros(self.batch_size, 1, device=self.device)
+            
+            # REBALANCED: Focus on active blocking and movement
+            total_reward = (
+                checkpoint_reward * 0.2 +        # Reduced base progress importance
+                blocking_reward * 0.5 +          # Increased blocking importance
+                support_reward * 0.4 +           # Increased support importance
+                movement_reward * 1.0 +          # INCREASED: severe penalty for no movement
+                timeout_penalty +                # Stronger stalling penalty
+                shield_spam_penalty              # Stronger shield spam penalty
+            )
+            
+            # Debug info - FIX: Only print for first blocker pod and first batch item
+            if pod_idx == 1 and self.batch_size > 0:
+                # Only access the first element of each tensor for printing
+                print(f"Blocker reward components: checkpoint={checkpoint_reward[0, 0].item():.3f}, "
+                    f"blocking={blocking_reward[0, 0].item():.3f}, support={support_reward[0, 0].item():.3f}, "
+                    f"movement={movement_reward[0, 0].item():.3f}, timeout={timeout_penalty[0, 0].item():.3f}, "
+                    f"shield={shield_spam_penalty[0, 0].item():.3f}, total={total_reward[0, 0].item():.3f}")
+            
+            return total_reward
         
-        # Base progress reward (same normalization as runner)
-        batch_total_checkpoints = (self.batch_checkpoint_counts * self.laps).float().unsqueeze(1)
-        checkpoint_reward = pod.current_checkpoint.float() / batch_total_checkpoints
-        
-        # Blocking rewards
-        blocking_reward = self._calculate_blocking_reward(pod_idx, opponent_player_idx)
-        
-        # Support runner reward
-        support_reward = self._calculate_support_reward(pod_idx, runner_idx)
-        
-        # ADDED: Timeout penalty to discourage excessive shielding/stalling
-        timeout_penalty = self._calculate_timeout_penalty(pod_idx)
-        
-        # ADDED: Anti-shield spam penalty
-        shield_spam_penalty = self._calculate_shield_spam_penalty(pod_idx)
-        
-        # REBALANCED: Reduce blocking emphasis, normalize total reward scale
-        total_reward = (
-            checkpoint_reward * 0.3 +        # Reduced from 0.5
-            blocking_reward * 0.4 +          # Reduced from 1.0
-            support_reward * 0.3 +           # Reduced from 0.5
-            timeout_penalty +                # NEW: penalize stalling
-            shield_spam_penalty              # NEW: penalize shield spam
-        )
-        
-        return total_reward
+        except Exception as e:
+            print(f"Error in _calculate_blocker_reward: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Return zero rewards as fallback
+            return torch.zeros(self.batch_size, 1, device=self.device)
 
-    def _calculate_shield_spam_penalty(self, pod_idx):
-        """Penalize excessive shield usage that leads to stalling"""
-        pod = self.pods[pod_idx]
-        
-        # Count how often shield is on cooldown (indicating recent shield use)
-        shield_usage_ratio = (pod.shield_cooldown > 0).float()
-        
-        # Calculate turns since last checkpoint
-        turns_since_checkpoint = self.turn_count - self.last_checkpoint_turn[:, pod_idx].unsqueeze(1)
-        timeout_progress = torch.clamp(turns_since_checkpoint.float() / MAX_TURNS_WITHOUT_CHECKPOINT, 0.0, 2.0)
-        
-        # Penalty increases if shield is used frequently while not progressing
-        shield_penalty = shield_usage_ratio * timeout_progress * 0.05
-        
-        return -shield_penalty
-    
     def _calculate_blocking_reward(self, blocker_idx, opponent_player_idx):
-        """Reward for blocking opponent pods - UPDATED to discourage pure stalling"""
-        blocker = self.pods[blocker_idx]
-        opponent_pods = [self.pods[opponent_player_idx * 2], self.pods[opponent_player_idx * 2 + 1]]
-        
-        total_blocking_reward = torch.zeros(self.batch_size, 1, device=self.device)
-        
-        for opp_pod in opponent_pods:
-            # Get opponent's next checkpoint using batch-specific counts
-            opp_next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
-            for b in range(self.batch_size):
-                num_cp = self.batch_checkpoint_counts[b].item()
-                opp_next_cp_idx = opp_pod.current_checkpoint[b] % num_cp
-                # Ensure the index is within bounds
-                opp_next_cp_idx = min(opp_next_cp_idx.item(), num_cp - 1)
-                opp_next_cp_pos[b] = self.checkpoints[b, opp_next_cp_idx]
+        """Reward for blocking opponent pods - emphasize active blocking"""
+        try:
+            blocker = self.pods[blocker_idx]
+            opponent_pods = [self.pods[opponent_player_idx * 2], self.pods[opponent_player_idx * 2 + 1]]
+            
+            total_blocking_reward = torch.zeros(self.batch_size, 1, device=self.device)
+            
+            for opp_idx, opp_pod in enumerate(opponent_pods):
+                try:
+                    # Get opponent's next checkpoint using batch-specific counts
+                    opp_next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
+                    for b in range(self.batch_size):
+                        num_cp = self.batch_checkpoint_counts[b].item()
+                        opp_next_cp_idx = opp_pod.current_checkpoint[b] % num_cp
+                        # Ensure the index is within bounds
+                        opp_next_cp_idx = min(opp_next_cp_idx.item(), num_cp - 1)
+                        opp_next_cp_pos[b] = self.checkpoints[b, opp_next_cp_idx]
 
-            # Reward for being between opponent and their checkpoint
-            opp_to_cp = opp_next_cp_pos - opp_pod.position
-            opp_to_blocker = blocker.position - opp_pod.position
+                    # Reward for being between opponent and their checkpoint
+                    opp_to_cp = opp_next_cp_pos - opp_pod.position
+                    opp_to_blocker = blocker.position - opp_pod.position
+                    
+                    # Calculate if blocker is in opponent's path
+                    opp_to_cp_norm = torch.norm(opp_to_cp, dim=1, keepdim=True)
+                    opp_to_cp_norm = torch.where(opp_to_cp_norm > 0, opp_to_cp_norm, torch.ones_like(opp_to_cp_norm))
+                    opp_direction = opp_to_cp / opp_to_cp_norm
+                    
+                    # Project blocker position onto opponent's path
+                    projection = torch.sum(opp_to_blocker * opp_direction, dim=1, keepdim=True)
+                    
+                    # Reward for being in front of opponent on their path
+                    path_blocking = torch.clamp(projection / 1000.0, 0.0, 1.0)
+                    
+                    # Distance-based blocking reward - higher reward for being closer
+                    blocker_to_opp = torch.norm(blocker.position - opp_pod.position, dim=1, keepdim=True)
+                    proximity_reward = torch.clamp(1.0 - blocker_to_opp / 2000.0, 0.0, 1.0)
+                    
+                    # Collision reward - significant bonus for actual collisions
+                    collision_reward = torch.zeros_like(proximity_reward)
+                    collision_threshold = 800.0  # Pod diameter
+                    collision_mask = blocker_to_opp < collision_threshold
+                    collision_reward[collision_mask] = 0.5
+                    
+                    # MODIFIED: Reward active blocking with NO minimum reward for stationary blockers
+                    blocker_speed = torch.norm(blocker.velocity, dim=1, keepdim=True)
+                    activity_multiplier = torch.clamp(blocker_speed / 200.0, 0.0, 1.0)  # No minimum reward (was 0.2)
+                    
+                    # ADDED: Reward for slowing down opponent (if we can track opponent's previous speed)
+                    slowdown_reward = torch.zeros_like(proximity_reward)
+                    if hasattr(self, '_prev_opp_speed'):
+                        if opp_idx in self._prev_opp_speed:
+                            opp_speed = torch.norm(opp_pod.velocity, dim=1, keepdim=True)
+                            speed_reduction = self._prev_opp_speed[opp_idx] - opp_speed
+                            slowdown_reward = torch.clamp(speed_reduction / 200.0, 0.0, 0.5)
+                    
+                    # Store opponent speed for next comparison
+                    if not hasattr(self, '_prev_opp_speed'):
+                        self._prev_opp_speed = {}
+                    self._prev_opp_speed[opp_idx] = torch.norm(opp_pod.velocity, dim=1, keepdim=True)
+                    
+                    blocking_component = (
+                        0.4 * path_blocking + 
+                        0.3 * proximity_reward + 
+                        0.2 * collision_reward +
+                        0.1 * slowdown_reward
+                    ) * activity_multiplier
+                    
+                    total_blocking_reward += blocking_component
+                except Exception as e:
+                    print(f"Error processing opponent {opp_idx} in _calculate_blocking_reward: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
             
-            # Calculate if blocker is in opponent's path
-            opp_to_cp_norm = torch.norm(opp_to_cp, dim=1, keepdim=True)
-            opp_to_cp_norm = torch.where(opp_to_cp_norm > 0, opp_to_cp_norm, torch.ones_like(opp_to_cp_norm))
-            opp_direction = opp_to_cp / opp_to_cp_norm
-            
-            # Project blocker position onto opponent's path
-            projection = torch.sum(opp_to_blocker * opp_direction, dim=1, keepdim=True)
-            
-            # Reward for being in front of opponent on their path
-            path_blocking = torch.clamp(projection / 1000.0, 0.0, 1.0)
-            
-            # Distance-based blocking reward
-            blocker_to_opp = torch.norm(blocker.position - opp_pod.position, dim=1, keepdim=True)
-            proximity_reward = torch.clamp(1.0 - blocker_to_opp / 2000.0, 0.0, 1.0)
-            
-            # ADDED: Reward active blocking (when blocker is also moving)
-            blocker_speed = torch.norm(blocker.velocity, dim=1, keepdim=True)
-            activity_multiplier = torch.clamp(blocker_speed / 200.0, 0.1, 1.0)  # Min 10% reward
-            
-            blocking_component = (0.7 * path_blocking + 0.3 * proximity_reward) * activity_multiplier
-            total_blocking_reward += blocking_component
+            return total_blocking_reward
         
-        return total_blocking_reward
+        except Exception as e:
+            print(f"Error in _calculate_blocking_reward: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return torch.zeros(self.batch_size, 1, device=self.device)
 
     def _calculate_support_reward(self, blocker_idx, runner_idx):
-        """Reward blocker for supporting runner - UPDATED to encourage active support"""
-        blocker = self.pods[blocker_idx]
-        runner = self.pods[runner_idx]
+        """Reward blocker for supporting runner with strategic positioning"""
+        try:
+            blocker = self.pods[blocker_idx]
+            runner = self.pods[runner_idx]
+            
+            # Get runner's next checkpoint
+            runner_next_cp_pos = torch.zeros(self.batch_size, 2, device=self.device)
+            for b in range(self.batch_size):
+                num_cp = self.batch_checkpoint_counts[b].item()
+                runner_next_cp_idx = runner.current_checkpoint[b] % num_cp
+                # Ensure the index is within bounds
+                runner_next_cp_idx = min(runner_next_cp_idx.item(), num_cp - 1)
+                runner_next_cp_pos[b] = self.checkpoints[b, runner_next_cp_idx]
+            
+            # Reward for not being too far from runner (coordination)
+            distance_to_runner = torch.norm(blocker.position - runner.position, dim=1, keepdim=True)
+            coordination_reward = torch.clamp(1.0 - distance_to_runner / 8000.0, 0.0, 1.0)
+            
+            # Reward for being in a supporting position (not directly in runner's path)
+            runner_to_cp = runner_next_cp_pos - runner.position
+            runner_to_cp_norm = torch.norm(runner_to_cp, dim=1, keepdim=True)
+            runner_to_cp_norm = torch.where(runner_to_cp_norm > 0, runner_to_cp_norm, torch.ones_like(runner_to_cp_norm))
+            runner_direction = runner_to_cp / runner_to_cp_norm
+            
+            # Calculate perpendicular vector to runner's path
+            # Fix: Reshape tensors to ensure proper broadcasting
+            perpendicular = torch.zeros_like(runner.position)
+            perpendicular[:, 0] = -runner_direction[:, 1]
+            perpendicular[:, 1] = runner_direction[:, 0]
+            
+            # Reward for being in a flanking position (to the side of runner's path)
+            blocker_rel_pos = blocker.position - runner.position
+            flanking_alignment = torch.abs(torch.sum(blocker_rel_pos * perpendicular, dim=1, keepdim=True))
+            flanking_reward = torch.clamp(flanking_alignment / 2000.0, 0.0, 1.0)
+            
+            # Small penalty if blocker is ahead of runner (runner should lead)
+            progress_diff = runner.current_checkpoint - blocker.current_checkpoint
+            leadership_reward = torch.clamp(progress_diff.float() * 0.1, -0.5, 0.5)
+            
+            # ADDED: Reward when both pods are making progress
+            runner_turns_since_cp = self.turn_count - self.last_checkpoint_turn[:, runner_idx].unsqueeze(1)
+            blocker_turns_since_cp = self.turn_count - self.last_checkpoint_turn[:, blocker_idx].unsqueeze(1)
+            
+            # Bonus when team is making consistent progress
+            team_progress_bonus = torch.clamp(
+                1.0 - (runner_turns_since_cp.float() + blocker_turns_since_cp.float()) / (2 * MAX_TURNS_WITHOUT_CHECKPOINT),
+                0.0, 0.3
+            )
+            
+            return (
+                0.3 * coordination_reward + 
+                0.3 * flanking_reward + 
+                0.2 * leadership_reward + 
+                0.2 * team_progress_bonus
+            )
         
-        # Reward for not being too far from runner (coordination)
-        distance_to_runner = torch.norm(blocker.position - runner.position, dim=1, keepdim=True)
-        coordination_reward = torch.clamp(1.0 - distance_to_runner / 8000.0, 0.0, 1.0)
-        
-        # Small penalty if blocker is ahead of runner (runner should lead)
-        progress_diff = runner.current_checkpoint - blocker.current_checkpoint
-        leadership_reward = torch.clamp(progress_diff.float() * 0.1, -0.5, 0.5)
-        
-        # ADDED: Reward when both pods are making progress
-        runner_turns_since_cp = self.turn_count - self.last_checkpoint_turn[:, runner_idx].unsqueeze(1)
-        blocker_turns_since_cp = self.turn_count - self.last_checkpoint_turn[:, blocker_idx].unsqueeze(1)
-        
-        # Bonus when team is making consistent progress
-        team_progress_bonus = torch.clamp(
-            1.0 - (runner_turns_since_cp.float() + blocker_turns_since_cp.float()) / (2 * MAX_TURNS_WITHOUT_CHECKPOINT),
-            0.0, 0.2
-        )
-        
-        return 0.3 * coordination_reward + 0.2 * leadership_reward + team_progress_bonus
+        except Exception as e:
+            print(f"Error in _calculate_support_reward: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return torch.zeros(self.batch_size, 1, device=self.device)
+
+    def _calculate_timeout_penalty(self, pod_idx):
+        """Calculate timeout penalty for a specific pod with progressive severity"""
+        try:
+            # Ensure pod_idx is within bounds
+            if pod_idx >= self.last_checkpoint_turn.shape[1]:
+                print(f"Warning: pod_idx {pod_idx} out of bounds for last_checkpoint_turn with shape {self.last_checkpoint_turn.shape}")
+                return torch.zeros(self.batch_size, 1, device=self.device)
+            
+            # Check tensor shapes for debugging
+            if self.turn_count.shape != torch.Size([self.batch_size, 1]):
+                print(f"Warning: turn_count has unexpected shape: {self.turn_count.shape}, expected: {[self.batch_size, 1]}")
+            
+            if self.last_checkpoint_turn.shape[0] != self.batch_size:
+                print(f"Warning: last_checkpoint_turn has unexpected first dimension: {self.last_checkpoint_turn.shape[0]}, expected: {self.batch_size}")
+            
+            # Extract the relevant checkpoint turn for this pod
+            last_cp_turn = self.last_checkpoint_turn[:, pod_idx].unsqueeze(1)
+            
+            # Calculate turns since last checkpoint
+            turns_since_checkpoint = self.turn_count - last_cp_turn
+            
+            # Progressive penalty that increases with time since last checkpoint
+            timeout_progress = turns_since_checkpoint.float() / MAX_TURNS_WITHOUT_CHECKPOINT
+            
+            # Exponential penalty - gets severe after threshold
+            penalty = torch.where(
+                timeout_progress > 0.7,  # Lower threshold for penalty onset
+                torch.exp(timeout_progress - 0.7) - 1.0,  # Exponential penalty after threshold
+                timeout_progress ** 2 * 0.1  # Quadratic penalty before threshold
+            )
+            
+            return -penalty * self.timeout_penalty_weight
+        except Exception as e:
+            print(f"Error in _calculate_timeout_penalty for pod_idx {pod_idx}: {str(e)}")
+            print(f"Debug info: turn_count shape={self.turn_count.shape}, last_checkpoint_turn shape={self.last_checkpoint_turn.shape}")
+            import traceback
+            traceback.print_exc()
+            return torch.zeros(self.batch_size, 1, device=self.device)
+
+    def _calculate_shield_spam_penalty(self, pod_idx):
+        """Calculate penalty for excessive shield usage"""
+        try:
+            pod = self.pods[pod_idx]
+            shield_active = pod.shield_cooldown > 0
+            
+            # Simple penalty based on shield cooldown
+            shield_penalty = torch.where(
+                shield_active,
+                torch.ones_like(pod.shield_cooldown) * 0.05,  # Small constant penalty when shield is active
+                torch.zeros_like(pod.shield_cooldown)
+            )
+            
+            return -shield_penalty
+        except Exception as e:
+            print(f"Error in _calculate_shield_spam_penalty for pod_idx {pod_idx}: {str(e)}")
+            print(f"Debug info: pod shield_cooldown shape={self.pods[pod_idx].shield_cooldown.shape}")
+            import traceback
+            traceback.print_exc()
+            return torch.zeros(self.batch_size, 1, device=self.device)
+
 
     def get_checkpoints(self):
         """Return checkpoint positions for visualization"""
@@ -977,6 +1256,44 @@ class OptimizedRaceEnvironment:
             # Return first batch's checkpoints
             return self.checkpoints[0].cpu().numpy().tolist()
         return []
+    
+    def _get_next_checkpoint_positions(self) -> Dict[int, torch.Tensor]:
+        """Get next checkpoint positions for all pods"""
+        next_cp_positions = {}
+        
+        try:
+            for pod_idx, pod in enumerate(self.pods):
+                # Get batch-specific next checkpoint positions
+                positions = torch.zeros(self.batch_size, 2, device=self.device)
+                
+                for b in range(self.batch_size):
+                    try:
+                        num_cp = self.batch_checkpoint_counts[b].item()
+                        next_cp_idx = pod.current_checkpoint[b] % num_cp
+                        
+                        # Debug info
+                        if b == 0 and pod_idx == 0:  # Only print for first batch and first pod
+                            print(f"Debug _get_next_checkpoint_positions: pod={pod_idx}, batch={b}, "
+                                f"current_cp={pod.current_checkpoint[b].item()}, num_cp={num_cp}, "
+                                f"next_cp_idx={next_cp_idx.item()}")
+                        
+                        # Ensure the index is within bounds
+                        next_cp_idx = min(int(next_cp_idx.item()), num_cp - 1)
+                        positions[b] = self.checkpoints[b, next_cp_idx]
+                    except Exception as e:
+                        # Fallback to first checkpoint if any error occurs
+                        print(f"Warning: Error getting next checkpoint for pod {pod_idx}, batch {b}: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+                        positions[b] = self.checkpoints[b, 0]
+                
+                next_cp_positions[pod_idx] = positions
+        except Exception as e:
+            print(f"Error in _get_next_checkpoint_positions: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        
+        return next_cp_positions
     
     def get_pod_states(self):
         """Get current pod states for visualization"""

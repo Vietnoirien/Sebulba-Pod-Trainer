@@ -26,6 +26,55 @@ class TrainingPanel(wx.Panel):
         # Create the content sizer inside the scrolled window
         content_sizer = wx.BoxSizer(wx.VERTICAL)
         
+        # Model Loading section (NEW)
+        model_box = wx.StaticBox(self.scroll_panel, label="Model Loading (Continue Training)")
+        model_sizer = wx.StaticBoxSizer(model_box, wx.VERTICAL)
+        
+        # Grid for model loading parameters
+        model_grid = wx.FlexGridSizer(rows=4, cols=2, vgap=10, hgap=10)
+        model_grid.AddGrowableCol(1, 1)
+        
+        # Continue training checkbox
+        model_grid.Add(wx.StaticText(self.scroll_panel, label="Continue from existing models:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.continue_training_check = wx.CheckBox(self.scroll_panel, label="")
+        model_grid.Add(self.continue_training_check, 0)
+        
+        # Model directory
+        model_grid.Add(wx.StaticText(self.scroll_panel, label="Model Directory:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        model_dir_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.model_dir_ctrl = wx.TextCtrl(self.scroll_panel, value="")
+        model_dir_sizer.Add(self.model_dir_ctrl, 1, wx.EXPAND)
+        self.model_browse_btn = wx.Button(self.scroll_panel, label="Browse...")
+        model_dir_sizer.Add(self.model_browse_btn, 0, wx.LEFT, 5)
+        model_grid.Add(model_dir_sizer, 0, wx.EXPAND)
+        
+        # Model selection strategy
+        model_grid.Add(wx.StaticText(self.scroll_panel, label="Model Selection:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.model_selection_choice = wx.Choice(self.scroll_panel, choices=[
+            "Latest iteration models",
+            "Best performance models", 
+            "Specific iteration models"
+        ])
+        self.model_selection_choice.SetSelection(0)
+        model_grid.Add(self.model_selection_choice, 0, wx.EXPAND)
+        
+        # Specific iteration (only enabled when "Specific iteration models" is selected)
+        model_grid.Add(wx.StaticText(self.scroll_panel, label="Specific Iteration:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.specific_iteration_ctrl = wx.SpinCtrl(self.scroll_panel, min=1, max=100000, initial=1)
+        self.specific_iteration_ctrl.Enable(False)
+        model_grid.Add(self.specific_iteration_ctrl, 0, wx.EXPAND)
+        
+        # Add model parameters to sizer
+        model_sizer.Add(model_grid, 0, wx.EXPAND | wx.ALL, 10)
+        
+        # Add help text for model loading
+        model_help_text = wx.StaticText(self.scroll_panel, label=
+            "• Latest iteration: Load the most recent saved models\n"
+            "• Best performance: Load models with highest recorded rewards\n"
+            "• Specific iteration: Load models from a particular training iteration")
+        model_help_text.SetFont(wx.Font(8, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_ITALIC, wx.FONTWEIGHT_NORMAL))
+        model_sizer.Add(model_help_text, 0, wx.EXPAND | wx.ALL, 5)
+        
         # Training parameters section
         training_box = wx.StaticBox(self.scroll_panel, label="Training Parameters")
         training_sizer = wx.StaticBoxSizer(training_box, wx.VERTICAL)
@@ -241,6 +290,7 @@ class TrainingPanel(wx.Panel):
         sync_sizer.Add(help_text, 0, wx.EXPAND | wx.ALL, 5)
         
         # Add all sections to content sizer (inside scrolled window)
+        content_sizer.Add(model_sizer, 0, wx.EXPAND | wx.ALL, 10)  # Add model loading section first
         content_sizer.Add(training_sizer, 0, wx.EXPAND | wx.ALL, 10)
         content_sizer.Add(ppo_sizer, 0, wx.EXPAND | wx.ALL, 10)
         content_sizer.Add(device_sizer, 0, wx.EXPAND | wx.ALL, 10)
@@ -267,12 +317,85 @@ class TrainingPanel(wx.Panel):
         
         # Bind events
         self.browse_btn.Bind(wx.EVT_BUTTON, self.on_browse)
+        self.model_browse_btn.Bind(wx.EVT_BUTTON, self.on_model_browse)  # NEW
         self.train_btn.Bind(wx.EVT_BUTTON, self.on_train)
         self.device_choice.Bind(wx.EVT_CHOICE, self.on_device_choice)
         self.parallel_check.Bind(wx.EVT_CHECKBOX, self.on_parallel_toggle)
+        self.continue_training_check.Bind(wx.EVT_CHECKBOX, self.on_continue_training_toggle)  # NEW
+        self.model_selection_choice.Bind(wx.EVT_CHOICE, self.on_model_selection_change)  # NEW
         
         # Initially disable sync options if parallel training is not enabled
         self.on_parallel_toggle(None)
+        
+        # Initially disable model loading options
+        self.on_continue_training_toggle(None)
+    
+    def on_model_browse(self, event):
+        """Open directory browser for model directory"""
+        dlg = wx.DirDialog(self, "Choose Model Directory", defaultPath=self.model_dir_ctrl.GetValue())
+        if dlg.ShowModal() == wx.ID_OK:
+            selected_path = dlg.GetPath()
+            self.model_dir_ctrl.SetValue(selected_path)
+            # Automatically scan for available models
+            self.scan_available_models(selected_path)
+        dlg.Destroy()
+    
+    def on_continue_training_toggle(self, event):
+        """Enable/disable model loading options based on continue training checkbox"""
+        enabled = self.continue_training_check.GetValue()
+        
+        self.model_dir_ctrl.Enable(enabled)
+        self.model_browse_btn.Enable(enabled)
+        self.model_selection_choice.Enable(enabled)
+        
+        # Enable specific iteration control only if "Specific iteration models"
+        if enabled and self.model_selection_choice.GetSelection() == 2:
+            self.specific_iteration_ctrl.Enable(True)
+        else:
+            self.specific_iteration_ctrl.Enable(False)
+    
+    def on_model_selection_change(self, event):
+        """Handle model selection strategy change"""
+        selection = self.model_selection_choice.GetSelection()
+        # Enable specific iteration control only for "Specific iteration models"
+        self.specific_iteration_ctrl.Enable(selection == 2 and self.continue_training_check.GetValue())
+    
+    def scan_available_models(self, model_dir):
+        """Scan the model directory for available models and update UI accordingly"""
+        try:
+            model_path = Path(model_dir)
+            if not model_path.exists():
+                return
+            
+            # Look for model files
+            model_files = list(model_path.glob("*.pt"))
+            if not model_files:
+                wx.MessageBox(f"No model files (.pt) found in {model_dir}", "No Models Found", wx.OK | wx.ICON_WARNING)
+                return
+            
+            # Extract iteration numbers from filenames
+            iterations = set()
+            for model_file in model_files:
+                # Look for patterns like "player0_runner_iter123.pt"
+                if "_iter" in model_file.stem:
+                    try:
+                        iter_part = model_file.stem.split("_iter")[1]
+                        iteration = int(iter_part)
+                        iterations.add(iteration)
+                    except (ValueError, IndexError):
+                        continue
+            
+            if iterations:
+                max_iteration = max(iterations)
+                self.specific_iteration_ctrl.SetMax(max_iteration)
+                self.specific_iteration_ctrl.SetValue(max_iteration)
+                print(f"Found models for iterations: {sorted(iterations)}")
+                print(f"Latest iteration: {max_iteration}")
+            else:
+                print("Found model files but couldn't extract iteration numbers")
+                
+        except Exception as e:
+            print(f"Error scanning model directory: {e}")
     
     def on_multi_gpu_toggle(self, event):
         """Enable/disable GPU selection based on multi-GPU checkbox"""
@@ -345,6 +468,12 @@ class TrainingPanel(wx.Panel):
         """Update UI elements from configuration"""
         config = self.main_frame.config
         
+        # Model loading parameters (NEW)
+        self.continue_training_check.SetValue(config.get('continue_training', False))
+        self.model_dir_ctrl.SetValue(config.get('model_dir', ''))
+        self.model_selection_choice.SetSelection(config.get('model_selection_strategy', 0))
+        self.specific_iteration_ctrl.SetValue(config.get('specific_iteration', 1))
+        
         # Training parameters
         self.batch_size_ctrl.SetValue(config.get('batch_size', 64))
         self.learning_rate_ctrl.SetValue(str(config.get('learning_rate', 0.0003)))
@@ -411,10 +540,19 @@ class TrainingPanel(wx.Panel):
         
         # Update device-dependent UI
         self.on_device_choice(None)
+        
+        # Update model loading dependent UI
+        self.on_continue_training_toggle(None)
     
     def update_config(self):
         """Update configuration from UI elements"""
         config = self.main_frame.config
+        
+        # Model loading parameters (NEW)
+        config['continue_training'] = self.continue_training_check.GetValue()
+        config['model_dir'] = self.model_dir_ctrl.GetValue()
+        config['model_selection_strategy'] = self.model_selection_choice.GetSelection()
+        config['specific_iteration'] = self.specific_iteration_ctrl.GetValue()
         
         # Training parameters
         config['batch_size'] = self.batch_size_ctrl.GetValue()

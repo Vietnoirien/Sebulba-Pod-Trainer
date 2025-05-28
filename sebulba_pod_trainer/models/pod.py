@@ -61,49 +61,45 @@ class Pod:
         self.angle = (self.angle + angle_diff) % 360
     
     def apply_thrust(self, thrust: torch.Tensor) -> None:
-        """Apply thrust in the direction the pod is facing"""
-        # Ensure thrust has the correct shape [batch_size, 1]
-        if thrust.numel() != self.batch_size:
-            # If thrust has wrong number of elements, reshape or truncate
-            if thrust.numel() > self.batch_size:
-                thrust = thrust.view(-1)[:self.batch_size].unsqueeze(1)
-            else:
-                # If too few elements, pad with zeros
-                thrust_padded = torch.zeros(self.batch_size, 1, device=self.device)
-                thrust_padded[:thrust.numel()] = thrust.view(-1, 1)
-                thrust = thrust_padded
-        elif thrust.shape != (self.batch_size, 1):
-            thrust = thrust.view(self.batch_size, 1)
-        
-        # Ensure angle has the correct shape [batch_size, 1]
-        if self.angle.shape != (self.batch_size, 1):
-            self.angle = self.angle.view(self.batch_size, 1)
+        """Apply thrust in the direction the pod is facing - SIMPLIFIED"""
+        # Ensure thrust is [batch_size, 1]
+        if thrust.dim() == 1:
+            thrust = thrust.unsqueeze(1)
         
         # Convert angle to radians
         angle_rad = torch.deg2rad(self.angle)
         
         # Calculate thrust components
-        thrust_x = torch.cos(angle_rad) * thrust  # [batch_size, 1]
-        thrust_y = torch.sin(angle_rad) * thrust  # [batch_size, 1]
-        
-        # Create thrust vector [batch_size, 2]
-        thrust_vector = torch.cat([thrust_x, thrust_y], dim=1)
-        
-        # Ensure velocity has the correct shape [batch_size, 2]
-        if self.velocity.shape != (self.batch_size, 2):
-            self.velocity = self.velocity.view(self.batch_size, 2)
+        thrust_x = torch.cos(angle_rad) * thrust
+        thrust_y = torch.sin(angle_rad) * thrust
         
         # Apply thrust to velocity
-        self.velocity += thrust_vector
-    
-    def apply_shield_selective(self, mask: torch.Tensor):
-        """Apply shield to selected pods based on mask"""
+        self.velocity[:, 0:1] += thrust_x
+        self.velocity[:, 1:2] += thrust_y
+
+    def apply_thrust_selective(self, thrust: torch.Tensor, mask: torch.Tensor) -> None:
+        """Apply thrust only to selected pods based on mask"""
         if mask.any():
-            self.shield_cooldown[mask] = 3
-            self.mass[mask] = 10  # Increase mass during shield
-    
+            # Get indices where thrust should be applied
+            thrust_indices = torch.where(mask)[0]
+            if len(thrust_indices) > 0:
+                # Apply thrust only to selected pods
+                selected_thrust = thrust[thrust_indices].unsqueeze(1)
+                
+                # Convert angle to radians for selected pods
+                selected_angles = self.angle[thrust_indices]
+                angle_rad = torch.deg2rad(selected_angles)
+                
+                # Calculate thrust components
+                thrust_x = torch.cos(angle_rad) * selected_thrust
+                thrust_y = torch.sin(angle_rad) * selected_thrust
+                
+                # Apply thrust to velocity
+                self.velocity[thrust_indices, 0:1] += thrust_x
+                self.velocity[thrust_indices, 1:2] += thrust_y
+
     def apply_boost_selective(self, mask: torch.Tensor):
-        """Apply boost to selected pods based on mask"""
+        """Apply boost to selected pods based on mask - SIMPLIFIED"""
         if mask.any():
             # Only boost if available
             available_mask = mask & self.boost_available.squeeze(-1).bool()
@@ -111,19 +107,30 @@ class Pod:
                 # Get indices of available pods
                 available_indices = torch.where(available_mask)[0]
                 
-                # Calculate thrust direction for available pods
-                selected_angles = self.angle[available_indices]
-                angle_rad = torch.deg2rad(selected_angles.squeeze(-1))
-                thrust_x = torch.cos(angle_rad) * BOOST_THRUST
-                thrust_y = torch.sin(angle_rad) * BOOST_THRUST
+                # Apply boost thrust
+                boost_thrust = torch.full((len(available_indices), 1), BOOST_THRUST, device=self.device)
                 
-                # Apply boost force using index_add_
-                self.velocity[available_indices, 0] += thrust_x
-                self.velocity[available_indices, 1] += thrust_y
+                # Convert angle to radians for available pods
+                selected_angles = self.angle[available_indices]
+                angle_rad = torch.deg2rad(selected_angles)
+                
+                # Calculate boost components
+                thrust_x = torch.cos(angle_rad) * boost_thrust
+                thrust_y = torch.sin(angle_rad) * boost_thrust
+                
+                # Apply boost to velocity
+                self.velocity[available_indices, 0:1] += thrust_x
+                self.velocity[available_indices, 1:2] += thrust_y
                 
                 # Mark boost as used
-                self.boost_available[available_indices, 0] = 0
+                self.boost_available[available_indices] = False
     
+    def apply_shield_selective(self, mask: torch.Tensor):
+        """Apply shield to selected pods based on mask"""
+        if mask.any():
+            self.shield_cooldown[mask] = 3
+            self.mass[mask] = 10  # Increase mass during shield
+        
     def move(self) -> None:
         """Move pod according to its velocity"""
         self.position += self.velocity

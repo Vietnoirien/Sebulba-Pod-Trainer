@@ -1,232 +1,197 @@
-import queue
 import threading
 import time
-import traceback
+import queue
+import wx
 from collections import defaultdict, deque
 
 class VisualizationConnector:
-    """Connects training processes with visualization panel"""
+    """Handles recording race states during training and smooth playback for visualization"""
     
-    def __init__(self, visualization_panel=None):
+    def __init__(self, visualization_panel):
         self.visualization_panel = visualization_panel
-        self.active = False
-        self.worker_data = {}
-        self.metrics_buffer = defaultdict(lambda: deque(maxlen=1000))  # Reduced buffer size
-        self.race_state_buffer = {}
-        self.last_update_time = defaultdict(float)
-        self.update_frequency = 1.0  # Reduced frequency: Update visualization every seconds
-        self.race_update_frequency = 0.5  # Update race visualization every 500ms
-        self.last_race_update = defaultdict(float)
-        print("VisualizationConnector initialized")
-    
-    def start(self, shared_queue):
-        """Start processing visualization data from queue"""
-        if not self.visualization_panel:
-            print("No visualization panel provided, visualization disabled")
-            return
-            
-        self.active = True
-        print("Starting visualization connector thread")
-        self.process_thread = threading.Thread(
-            target=self._process_queue_data,
-            args=(shared_queue,)
-        )
-        self.process_thread.daemon = True
-        self.process_thread.start()
-        print("Visualization connector thread started")
+        self.recording_queue = None
+        self.playback_thread = None
+        self.recording_thread = None
+        self.is_running = False
         
+        # Recording storage - organized by worker and timestamped
+        self.recorded_states = defaultdict(deque)  # worker_id -> deque of (timestamp, race_state)
+        self.recorded_metrics = deque()  # (timestamp, metrics)
+        
+        # Playback control
+        self.playback_speed = 1.0  # 1.0 = real-time, 2.0 = 2x speed, etc.
+        self.recording_start_time = None
+        self.playback_start_time = None
+        
+        # Buffering for smooth playback
+        self.playback_buffer_size = 100  # Keep last 100 states per worker
+        self.metrics_buffer_size = 1000   # Keep last 1000 metrics
+        
+    def start(self, recording_queue):
+        """Start the recording and playback system"""
+        self.recording_queue = recording_queue
+        self.is_running = True
+        self.recording_start_time = time.time()
+        self.playback_start_time = time.time()
+        
+        # Start recording thread (receives data from training)
+        self.recording_thread = threading.Thread(target=self._recording_worker, daemon=True)
+        self.recording_thread.start()
+        
+        # Start playback thread (sends data to UI)
+        self.playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
+        self.playback_thread.start()
+        
+        print("VisualizationConnector started - recording and playback active")
+    
     def stop(self):
-        """Stop processing visualization data"""
-        print("Stopping visualization connector")
-        self.active = False
-        if hasattr(self, 'process_thread'):
-            self.process_thread.join(timeout=2.0)
-        print("Visualization connector stopped")
-    
-    def _process_queue_data(self, shared_queue):
-        """Process data from the queue and send to visualization panel"""
-        print("Visualization data processing thread started")
+        """Stop the recording and playback system"""
+        self.is_running = False
         
-        while self.active:
+        if self.recording_thread and self.recording_thread.is_alive():
+            self.recording_thread.join(timeout=2.0)
+        
+        if self.playback_thread and self.playback_thread.is_alive():
+            self.playback_thread.join(timeout=2.0)
+        
+        print("VisualizationConnector stopped")
+    
+    def _recording_worker(self):
+        """Background thread that records incoming data from training processes"""
+        print("Recording worker started")
+        
+        while self.is_running:
             try:
-                # Get data with timeout to allow checking active flag
-                data = shared_queue.get(timeout=1.0)  # Increased timeout
+                # Get data from training processes with timeout
+                data = self.recording_queue.get(timeout=0.5)
+                current_time = time.time()
+                relative_time = current_time - self.recording_start_time
                 
-                # Process the data with throttling
-                self._handle_data_throttled(data)
+                if 'race_state' in data:
+                    # Record race state with timestamp
+                    race_state = data['race_state']
+                    worker_id = race_state.get('worker_id', 'unknown')
                     
+                    # Add to recording buffer
+                    self.recorded_states[worker_id].append((relative_time, race_state))
+                    
+                    # Limit buffer size to prevent memory issues
+                    if len(self.recorded_states[worker_id]) > self.playback_buffer_size:
+                        self.recorded_states[worker_id].popleft()
+                
+                elif 'iteration' in data:
+                    # Record training metrics with timestamp
+                    self.recorded_metrics.append((relative_time, data))
+                    
+                    # Limit buffer size
+                    if len(self.recorded_metrics) > self.metrics_buffer_size:
+                        self.recorded_metrics.popleft()
+                
             except queue.Empty:
-                # Check if we should send buffered data
-                self._check_and_send_buffered_data()
-                time.sleep(0.2)  # Increased sleep time
+                # No data available, continue
                 continue
             except Exception as e:
-                print(f"Error processing visualization data: {e}")
-                print(traceback.format_exc())
-    
-    def _handle_data_throttled(self, data):
-        """Handle incoming data with throttling to prevent UI overload"""
-        try:
-            worker_id = self._extract_worker_id(data)
-            current_time = time.time()
-            
-            if 'race_state' in data:
-                # Throttle race state updates
-                if worker_id not in self.last_race_update:
-                    self.last_race_update[worker_id] = 0
-                    
-                if current_time - self.last_race_update[worker_id] >= self.race_update_frequency:
-                    self._handle_race_state(data, worker_id)
-                    self.last_race_update[worker_id] = current_time
-                # else: skip this race state update
-                    
-            elif 'iteration' in data:
-                self._handle_metrics(data, worker_id)
-            else:
-                print(f"Unknown data type received: {list(data.keys())}")
-                
-        except Exception as e:
-            print(f"Error handling data: {e}")
-            print(traceback.format_exc())
-    
-    def _extract_worker_id(self, data):
-        """Extract worker ID from data"""
-        if 'race_state' in data:
-            return data['race_state'].get('worker_id', 'main')
-        elif 'worker_id' in data:
-            return data['worker_id']
-        else:
-            return 'main'
-    
-    def _handle_race_state(self, data, worker_id):
-        """Handle race state data - non-blocking"""
-        try:
-            # Ensure worker_id is in race_state
-            if 'worker_id' not in data['race_state']:
-                data['race_state']['worker_id'] = worker_id
-            
-            # Store the latest race state for this worker
-            self.race_state_buffer[worker_id] = data
-            
-            # Send to visualization panel using non-blocking method
-            if self.visualization_panel is not None:
-                try:
-                    # Use the panel's add_metric method instead of direct call
-                    self.visualization_panel.add_metric(data)
-                    
-                    # Reduced debug info
-                    if worker_id.endswith('_env_0'):  # Only log for first environment per GPU
-                        pods_count = len(data['race_state'].get('pods', []))
-                        # print(f"Sent race state from {worker_id}: {pods_count} pods")
-                        
-                except Exception as e:
-                    print(f"Error sending race state to visualization panel: {e}")
-                    
-        except Exception as e:
-            print(f"Error in _handle_race_state: {e}")
-    
-    def _handle_metrics(self, data, worker_id):
-        """Handle training metrics data"""
-        # Ensure worker_id is in data
-        if 'worker_id' not in data:
-            data['worker_id'] = worker_id
+                print(f"Error in recording worker: {e}")
+                continue
         
-        # Buffer the metrics (reduced buffer size will automatically drop old data)
-        self.metrics_buffer[worker_id].append(data)
-        
-        # Reduced debug output
-        if data['iteration'] % 10 == 0:  # Only log every 10th iteration
-            iteration = data['iteration']
-            reward = data.get('total_reward', data.get('reward', 0))
-            print(f"Buffered metric from {worker_id}: iteration={iteration}, reward={reward:.4f}")
+        print("Recording worker stopped")
     
-    def _check_and_send_buffered_data(self):
-        """Check if we should send buffered metrics data"""
-        current_time = time.time()
+    def _playback_worker(self):
+        """Background thread that plays back recorded data to the UI smoothly"""
+        print("Playback worker started")
         
-        for worker_id in list(self.metrics_buffer.keys()):
-            last_update = self.last_update_time[worker_id]
-            
-            # Send buffered metrics if enough time has passed
-            if (current_time - last_update) >= self.update_frequency:
-                self._send_buffered_metrics(worker_id)
-                self.last_update_time[worker_id] = current_time
-    
-    def _send_buffered_metrics(self, worker_id):
-        """Send buffered metrics for a specific worker - non-blocking"""
-        if worker_id not in self.metrics_buffer or len(self.metrics_buffer[worker_id]) == 0:
-            return
+        # Track what we've already played back
+        last_played_metrics_time = 0
+        last_played_race_times = defaultdict(float)  # worker_id -> last_played_time
         
-        # Get only the latest few metrics to avoid overwhelming the UI
-        max_metrics_to_send = 5  # Limit to 5 metrics per batch
-        metrics_to_send = list(self.metrics_buffer[worker_id])[-max_metrics_to_send:]
-        
-        # Clear the buffer
-        self.metrics_buffer[worker_id].clear()
-        
-        # Send metrics using non-blocking method
-        if self.visualization_panel is not None:
+        while self.is_running:
             try:
-                for metric in metrics_to_send:
-                    # Use add_metric which puts data in queue instead of direct UI update
-                    self.visualization_panel.add_metric(metric)
+                current_time = time.time()
+                playback_time = (current_time - self.playback_start_time) * self.playback_speed
                 
-                # Reduced logging
-                if len(metrics_to_send) > 0:
-                    print(f"Sent {len(metrics_to_send)} metrics from {worker_id}")
+                # Playback metrics
+                self._playback_metrics(playback_time, last_played_metrics_time)
+                last_played_metrics_time = playback_time
+                
+                # Playback race states for all workers
+                for worker_id in list(self.recorded_states.keys()):
+                    last_played_time = last_played_race_times[worker_id]
+                    new_last_time = self._playback_race_states(worker_id, playback_time, last_played_time)
+                    last_played_race_times[worker_id] = new_last_time
+                
+                # Sleep to maintain smooth playback (60 FPS equivalent)
+                time.sleep(1.0 / 60.0)
                 
             except Exception as e:
-                print(f"Error sending buffered metrics to visualization panel: {e}")
+                print(f"Error in playback worker: {e}")
+                time.sleep(0.1)
+                continue
+        
+        print("Playback worker stopped")
     
-    def set_update_frequency(self, frequency):
-        """Set the update frequency for metrics (in seconds)"""
-        self.update_frequency = max(1.0, frequency)  # Minimum 1 second
-        self.race_update_frequency = max(0.5, frequency * 0.5)  # Race updates at half frequency
-        print(f"Visualization update frequency set to {self.update_frequency} seconds")
+    def _playback_metrics(self, current_playback_time, last_played_time):
+        """Playback metrics that should be shown at current time"""
+        try:
+            for recorded_time, metrics in self.recorded_metrics:
+                if last_played_time < recorded_time <= current_playback_time:
+                    # This metric should be played back now
+                    wx.CallAfter(self._send_metrics_to_ui, metrics)
+        except Exception as e:
+            print(f"Error in metrics playback: {e}")
     
-    def get_worker_stats(self):
-        """Get statistics about workers and their data"""
-        stats = {}
-        
-        for worker_id in self.metrics_buffer:
-            stats[worker_id] = {
-                'buffered_metrics': len(self.metrics_buffer[worker_id]),
-                'has_race_state': worker_id in self.race_state_buffer,
-                'last_update': self.last_update_time.get(worker_id, 0)
-            }
-        
-        return stats
-    
-    def flush_all_buffers(self):
-        """Flush all buffered data immediately"""
-        print("Flushing all visualization buffers")
-        
-        for worker_id in list(self.metrics_buffer.keys()):
-            self._send_buffered_metrics(worker_id)
-            self.last_update_time[worker_id] = time.time()
-        
-        print("All buffers flushed")
-    
-    def clear_worker_data(self, worker_id):
-        """Clear data for a specific worker"""
-        if worker_id in self.metrics_buffer:
-            self.metrics_buffer[worker_id].clear()
-        
-        if worker_id in self.race_state_buffer:
-            del self.race_state_buffer[worker_id]
-        
-        if worker_id in self.last_update_time:
-            del self.last_update_time[worker_id]
+    def _playback_race_states(self, worker_id, current_playback_time, last_played_time):
+        """Playback race states for a specific worker"""
+        try:
+            worker_states = self.recorded_states[worker_id]
+            new_last_time = last_played_time
             
-        if worker_id in self.last_race_update:
-            del self.last_race_update[worker_id]
+            for recorded_time, race_state in worker_states:
+                if last_played_time < recorded_time <= current_playback_time:
+                    # This race state should be played back now
+                    wx.CallAfter(self._send_race_state_to_ui, worker_id, race_state)
+                    new_last_time = recorded_time
+            
+            return new_last_time
+            
+        except Exception as e:
+            print(f"Error in race state playback for {worker_id}: {e}")
+            return last_played_time
+    
+    def _send_metrics_to_ui(self, metrics):
+        """Send metrics to UI thread safely"""
+        try:
+            if self.visualization_panel and hasattr(self.visualization_panel, '_add_metric_data'):
+                # Extract the metrics data
+                iteration = metrics.get('iteration', 0)
+                reward = metrics.get('total_reward', metrics.get('reward', 0))
+                policy_loss = metrics.get('policy_loss', 0)
+                value_loss = metrics.get('value_loss', 0)
+                
+                # Send to visualization panel
+                self.visualization_panel._add_metric_data(iteration, reward, policy_loss, value_loss)
+                
+        except Exception as e:
+            print(f"Error sending metrics to UI: {e}")
+    
+    def _send_race_state_to_ui(self, worker_id, race_state):
+        """Send race state to UI thread safely"""
+        try:
+            if self.visualization_panel and hasattr(self.visualization_panel, 'update_race_visualization_throttled'):
+                # Send to visualization panel
+                self.visualization_panel.update_race_visualization_throttled(race_state, worker_id)
+                
+        except Exception as e:
+            print(f"Error sending race state to UI: {e}")
+    
+    def get_recording_stats(self):
+        """Get statistics about the current recording"""
+        total_race_states = sum(len(states) for states in self.recorded_states.values())
+        total_metrics = len(self.recorded_metrics)
+        active_workers = len(self.recorded_states)
         
-        print(f"Cleared data for worker: {worker_id}")
-    
-    def get_latest_race_state(self, worker_id):
-        """Get the latest race state for a specific worker"""
-        return self.race_state_buffer.get(worker_id, None)
-    
-    def get_buffered_metrics_count(self, worker_id):
-        """Get the number of buffered metrics for a specific worker"""
-        return len(self.metrics_buffer.get(worker_id, []))
+        return {
+            'total_race_states': total_race_states,
+            'total_metrics': total_metrics,
+            'active_workers': active_workers,
+            'recording_duration': time.time() - self.recording_start_time if self.recording_start_time else 0
+        }

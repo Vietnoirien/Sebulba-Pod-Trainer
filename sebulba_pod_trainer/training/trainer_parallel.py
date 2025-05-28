@@ -11,11 +11,210 @@ from copy import deepcopy
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
 import random
+import glob
 
 from ..environment.race_env import RaceEnvironment
 from ..environment.optimized_race_env import OptimizedRaceEnvironment
 from .trainer import PPOTrainer
 from .optimized_trainer import OptimizedPPOTrainer
+from .visualization_connector import VisualizationConnector
+
+
+class ModelLoader:
+    """Utility class for loading existing models"""
+    
+    @staticmethod
+    def find_models(model_dir, strategy='latest', specific_iteration=None):
+        """
+        Find model files based on the specified strategy
+        
+        Args:
+            model_dir: Directory containing model files
+            strategy: 'latest', 'best', or 'specific'
+            specific_iteration: Iteration number for 'specific' strategy
+            
+        Returns:
+            Dictionary mapping pod roles to model file paths
+        """
+        model_path = Path(model_dir)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model directory {model_dir} does not exist")
+        
+        # Find all model files
+        model_files = list(model_path.glob("*.pt"))
+        if not model_files:
+            raise FileNotFoundError(f"No model files found in {model_dir}")
+        
+        print(f"Found {len(model_files)} model files in {model_dir}")
+        
+        if strategy == 'latest':
+            return ModelLoader._find_latest_models(model_files)
+        elif strategy == 'best':
+            return ModelLoader._find_best_models(model_path, model_files)
+        elif strategy == 'specific':
+            return ModelLoader._find_specific_iteration_models(model_files, specific_iteration)
+        else:
+            raise ValueError(f"Unknown model selection strategy: {strategy}")
+    
+    @staticmethod
+    def _find_latest_models(model_files):
+        """Find the latest iteration models for each role"""
+        role_models = {'runner': None, 'blocker': None}
+        role_iterations = {'runner': -1, 'blocker': -1}
+        
+        for model_file in model_files:
+            # Parse filename to extract role and iteration
+            filename = model_file.stem
+            
+            # Look for role indicators
+            if 'runner' in filename:
+                role = 'runner'
+            elif 'blocker' in filename:
+                role = 'blocker'
+            else:
+                continue  # Skip files that don't match expected naming
+            
+            # Extract iteration number
+            if '_iter' in filename:
+                try:
+                    iter_part = filename.split('_iter')[1]
+                    iteration = int(iter_part)
+                    
+                    # Keep track of the latest iteration for each role
+                    if iteration > role_iterations[role]:
+                        role_iterations[role] = iteration
+                        role_models[role] = model_file
+                        
+                except (ValueError, IndexError):
+                    continue
+        
+        # Check if we found models for both roles
+        missing_roles = [role for role, model in role_models.items() if model is None]
+        if missing_roles:
+            print(f"Warning: Could not find latest models for roles: {missing_roles}")
+            # Try to find any models for missing roles (without iteration numbers)
+            for model_file in model_files:
+                filename = model_file.stem
+                for role in missing_roles:
+                    if role in filename and role_models[role] is None:
+                        role_models[role] = model_file
+                        print(f"Using fallback model for {role}: {model_file}")
+                        break
+        
+        print(f"Latest models found:")
+        for role, model_file in role_models.items():
+            if model_file:
+                print(f"  {role}: {model_file} (iteration {role_iterations[role]})")
+            else:
+                print(f"  {role}: No model found")
+        
+        return role_models
+    
+    @staticmethod
+    def _find_best_models(model_path, model_files):
+        """Find the best performing models based on training logs"""
+        # Try to find training log files
+        log_files = list(model_path.glob("training_log_*.txt"))
+        
+        if not log_files:
+            print("No training log files found, falling back to latest models")
+            return ModelLoader._find_latest_models(model_files)
+        
+        # Parse logs to find best performing iterations
+        best_rewards = {'runner': float('-inf'), 'blocker': float('-inf')}
+        best_iterations = {'runner': -1, 'blocker': -1}
+        
+        for log_file in log_files:
+            try:
+                with open(log_file, 'r') as f:
+                    for line in f:
+                        if 'iteration=' in line and 'runner_reward=' in line and 'blocker_reward=' in line:
+                            # Parse log line
+                            parts = line.strip().split(',')
+                            data = {}
+                            for part in parts:
+                                if '=' in part:
+                                    key, value = part.split('=', 1)
+                                    try:
+                                        data[key] = float(value)
+                                    except ValueError:
+                                        data[key] = value
+                            
+                            iteration = int(data.get('iteration', -1))
+                            runner_reward = data.get('runner_reward', float('-inf'))
+                            blocker_reward = data.get('blocker_reward', float('-inf'))
+                            
+                            # Update best rewards and iterations
+                            if runner_reward > best_rewards['runner']:
+                                best_rewards['runner'] = runner_reward
+                                best_iterations['runner'] = iteration
+                            
+                            if blocker_reward > best_rewards['blocker']:
+                                best_rewards['blocker'] = blocker_reward
+                                best_iterations['blocker'] = iteration
+                                
+            except Exception as e:
+                print(f"Error parsing log file {log_file}: {e}")
+        
+        # Find model files for the best iterations
+        role_models = {'runner': None, 'blocker': None}
+        
+        for role in ['runner', 'blocker']:
+            best_iter = best_iterations[role]
+            if best_iter > 0:
+                # Look for model file with this iteration
+                for model_file in model_files:
+                    if role in model_file.stem and f'_iter{best_iter}' in model_file.stem:
+                        role_models[role] = model_file
+                        break
+        
+        # Fall back to latest models for any missing roles
+        if any(model is None for model in role_models.values()):
+            print("Some best models not found, filling in with latest models")
+            latest_models = ModelLoader._find_latest_models(model_files)
+            for role in role_models:
+                if role_models[role] is None:
+                    role_models[role] = latest_models[role]
+        
+        print(f"Best performing models found:")
+        for role, model_file in role_models.items():
+            if model_file:
+                best_reward = best_rewards[role]
+                best_iter = best_iterations[role]
+                print(f"  {role}: {model_file} (iteration {best_iter}, reward {best_reward:.4f})")
+        
+        return role_models
+    
+    @staticmethod
+    def _find_specific_iteration_models(model_files, iteration):
+        """Find models from a specific iteration"""
+        if iteration is None:
+            raise ValueError("Specific iteration must be provided")
+        
+        role_models = {'runner': None, 'blocker': None}
+        
+        for model_file in model_files:
+            filename = model_file.stem
+            
+            # Check if this file is from the specified iteration
+            if f'_iter{iteration}' in filename:
+                # Determine role
+                if 'runner' in filename:
+                    role_models['runner'] = model_file
+                elif 'blocker' in filename:
+                    role_models['blocker'] = model_file
+        
+        # Check if we found models for both roles
+        missing_roles = [role for role, model in role_models.items() if model is None]
+        if missing_roles:
+            raise FileNotFoundError(f"Could not find iteration {iteration} models for roles: {missing_roles}")
+        
+        print(f"Specific iteration {iteration} models found:")
+        for role, model_file in role_models.items():
+            print(f"  {role}: {model_file}")
+        
+        return role_models
+
 
 class SharedExperienceBuffer:
     """Shared experience buffer across workers"""
@@ -40,7 +239,7 @@ class SharedExperienceBuffer:
 class ParallelPPOTrainer:
     """
     Parallelized PPO Trainer that runs multiple environments across available GPUs
-    with model synchronization for improved convergence
+    with model synchronization for improved convergence and support for continuing training
     """
     def __init__(self, env_config, trainer_args, envs_per_gpu=8):
         # Set the start method for multiprocessing to 'spawn'
@@ -68,6 +267,12 @@ class ParallelPPOTrainer:
         self.gradient_aggregation = self.trainer_args.get('gradient_aggregation', True)
         self.adaptive_lr = self.trainer_args.get('adaptive_lr', True)
 
+        # Add model loading parameters (NEW)
+        self.continue_training = self.trainer_args.get('continue_training', False)
+        self.model_dir = self.trainer_args.get('model_dir', '')
+        self.model_selection_strategy = self.trainer_args.get('model_selection_strategy', 0)  # 0=latest, 1=best, 2=specific
+        self.specific_iteration = self.trainer_args.get('specific_iteration', 1)
+
         # Add timeout penalty configuration
         if 'timeout_penalty_weight' not in self.env_config:
             self.env_config['timeout_penalty_weight'] = 0.01  # Default timeout penalty weight
@@ -84,18 +289,80 @@ class ParallelPPOTrainer:
         print(f"Gradient aggregation: {self.gradient_aggregation}")
         print(f"Timeout penalty weight: {self.env_config['timeout_penalty_weight']}")
         
+        # Print model loading configuration (NEW)
+        print(f"Continue training: {self.continue_training}")
+        if self.continue_training:
+            strategy_names = ['latest', 'best', 'specific']
+            strategy_name = strategy_names[self.model_selection_strategy] if self.model_selection_strategy < len(strategy_names) else 'unknown'
+            print(f"Model directory: {self.model_dir}")
+            print(f"Model selection strategy: {strategy_name}")
+            if self.model_selection_strategy == 2:  # specific iteration
+                print(f"Specific iteration: {self.specific_iteration}")
+        
         # Calculate total number of environments
         self.total_envs = self.num_gpus * self.envs_per_gpu
         print(f"Total environments: {self.total_envs}")
+    
+    def _load_pretrained_models(self):
+        """Load pretrained models if continue_training is enabled"""
+        if not self.continue_training or not self.model_dir:
+            return None
+        
+        try:
+            # Map strategy index to string
+            strategy_map = {0: 'latest', 1: 'best', 2: 'specific'}
+            strategy = strategy_map.get(self.model_selection_strategy, 'latest')
+            
+            specific_iter = self.specific_iteration if strategy == 'specific' else None
+            
+            print(f"Loading pretrained models using strategy: {strategy}")
+            if specific_iter:
+                print(f"Target iteration: {specific_iter}")
+            
+            # Find model files
+            role_models = ModelLoader.find_models(
+                self.model_dir, 
+                strategy=strategy, 
+                specific_iteration=specific_iter
+            )
+            
+            # Load the model state dictionaries
+            loaded_models = {}
+            for role, model_file in role_models.items():
+                if model_file and model_file.exists():
+                    try:
+                        state_dict = torch.load(model_file, map_location='cpu')
+                        loaded_models[role] = state_dict
+                        print(f"Successfully loaded {role} model from {model_file}")
+                    except Exception as e:
+                        print(f"Error loading {role} model from {model_file}: {e}")
+                        return None
+                else:
+                    print(f"Model file not found for {role}: {model_file}")
+                    return None
+            
+            if len(loaded_models) == 2:  # Both runner and blocker models loaded
+                print("Successfully loaded all pretrained models")
+                return loaded_models
+            else:
+                print("Failed to load all required models")
+                return None
+                
+        except Exception as e:
+            print(f"Error loading pretrained models: {e}")
+            return None
     
     @staticmethod
     def _worker(gpu_id, env_indices, env_config, trainer_args, total_envs, envs_per_gpu, 
                 use_mixed_precision, shared_results, vis_queue=None, shared_models=None, 
                 shared_experience=None, shared_metrics=None, sync_interval=5, 
-                gradient_aggregation=True, adaptive_lr=True, num_gpus=1):
-        """Enhanced worker process with model synchronization and experience sharing"""
+                gradient_aggregation=True, adaptive_lr=True, num_gpus=1, pretrained_models=None):
+        """Enhanced worker process with model synchronization, experience sharing, and pretrained model loading"""
         try:
             print(f"Worker process for GPU {gpu_id} starting with timeout penalty prevention...")
+            if pretrained_models:
+                print(f"Worker {gpu_id} will load pretrained models")
+            
             # Set CUDA device for this process
             try:
                 torch.cuda.set_device(gpu_id)
@@ -182,6 +449,58 @@ class ParallelPPOTrainer:
                 print(f"Error creating trainer on device {device}: {e}")
                 raise
             
+            # Load pretrained models if provided (NEW)
+            if pretrained_models:
+                print(f"GPU {gpu_id} - Loading pretrained models...")
+                try:
+                    for pod_key, network in trainer.pod_networks.items():
+                        # Extract role from pod_key (pod0 = runner, pod1 = blocker)
+                        parts = pod_key.split('_')
+                        team_pod_idx = int(parts[1].replace('pod', ''))
+                        role = "runner" if team_pod_idx == 0 else "blocker"
+                        
+                        if role in pretrained_models:
+                            # Load the pretrained weights
+                            pretrained_state = pretrained_models[role]
+                            
+                            # Handle potential device mismatch
+                            device_state = {}
+                            for key, value in pretrained_state.items():
+                                if isinstance(value, torch.Tensor):
+                                    device_state[key] = value.to(device)
+                                else:
+                                    device_state[key] = value
+                            
+                            # Load state dict with error handling
+                            try:
+                                network.load_state_dict(device_state, strict=True)
+                                print(f"GPU {gpu_id} - Successfully loaded pretrained weights for {pod_key} ({role})")
+                            except Exception as load_error:
+                                print(f"GPU {gpu_id} - Error loading pretrained weights for {pod_key} ({role}): {load_error}")
+                                print(f"GPU {gpu_id} - Attempting partial load...")
+                                # Try partial loading
+                                current_state = network.state_dict()
+                                for key in current_state:
+                                    if key in device_state:
+                                        try:
+                                            if current_state[key].shape == device_state[key].shape:
+                                                current_state[key] = device_state[key]
+                                            else:
+                                                print(f"GPU {gpu_id} - Shape mismatch for {key}: {current_state[key].shape} vs {device_state[key].shape}")
+                                        except Exception as param_error:
+                                            print(f"GPU {gpu_id} - Error loading parameter {key}: {param_error}")
+                                
+                                network.load_state_dict(current_state)
+                                print(f"GPU {gpu_id} - Partial load completed for {pod_key} ({role})")
+                        else:
+                            print(f"GPU {gpu_id} - No pretrained model found for role {role}")
+                    
+                    print(f"GPU {gpu_id} - Pretrained model loading completed")
+                    
+                except Exception as e:
+                    print(f"GPU {gpu_id} - Error during pretrained model loading: {e}")
+                    print(f"GPU {gpu_id} - Continuing with randomly initialized models")
+            
             # Extract training parameters from trainer_args
             training_args = {
                 'num_iterations': trainer_args.get('num_iterations', 1000),
@@ -192,6 +511,8 @@ class ParallelPPOTrainer:
 
             print(f"Worker on GPU {gpu_id} training with: iterations={training_args['num_iterations']}, steps={training_args['steps_per_iteration']}")
             print(f"Worker on GPU {gpu_id} timeout penalty enabled - no more timeout exploitation!")
+            if pretrained_models:
+                print(f"Worker on GPU {gpu_id} continuing training from pretrained models!")
             
             # Initialize mixed precision scaler if enabled
             scaler = None
@@ -541,8 +862,8 @@ class ParallelPPOTrainer:
                                         if len(trainer.pod_trails[pod_key]) > 50:
                                             trainer.pod_trails[pod_key] = trainer.pod_trails[pod_key][-50:]
                         
-                        # Send race state to visualization occasionally
-                        if vis_queue is not None and step % 10 == 0:
+                        # Send race state to visualization occasionally with recording system
+                        if vis_queue is not None and step % 2 == 0:
                             try:
                                 # Create a unique worker ID that includes both GPU ID and environment index
                                 worker_id = f"gpu_{gpu_id}_env_{env_indices[env_idx]}"
@@ -560,7 +881,10 @@ class ParallelPPOTrainer:
                                 vis_race_state = {
                                     'checkpoints': checkpoints,
                                     'pods': [],
-                                    'worker_id': worker_id  # Include both GPU ID and environment index
+                                    'worker_id': worker_id,
+                                    'step': step,  # Add step for better playback
+                                    'gpu_id': gpu_id,
+                                    'env_idx': env_indices[env_idx]
                                 }
                                 
                                 # Add pod information from observations
@@ -608,13 +932,16 @@ class ParallelPPOTrainer:
                                             
                                             vis_race_state['pods'].append(pod_info)
                                 
-                                # Put in queue if we have pod data
+                                # Put in queue if we have pod data - non-blocking
                                 if len(vis_race_state['pods']) > 0 and len(vis_race_state['checkpoints']) > 0:
-                                    vis_queue.put({'race_state': vis_race_state})
+                                    try:
+                                        vis_queue.put_nowait({'race_state': vis_race_state})
+                                    except queue.Full:
+                                        # Queue is full, skip this update to prevent blocking training
+                                        pass
                             except Exception as e:
                                 # Don't let visualization errors affect training
                                 print(f"Error sending race state to visualization: {e}")
-                                print(traceback.format_exc())
 
                         # Store trajectory data with explicit device management and NaN checking
                         for pod_key in trainer.pod_networks.keys():
@@ -799,10 +1126,23 @@ class ParallelPPOTrainer:
             # Check networks before starting training
             check_and_fix_network_parameters()
 
-            # Initialize shared models if this is the first worker
-            if shared_models is not None and gpu_id == 0:
+            # Initialize shared models if this is the first worker and no pretrained models
+            if shared_models is not None and gpu_id == 0 and not pretrained_models:
                 print(f"GPU {gpu_id} - Initializing shared model parameters")
                 update_shared_models()
+            elif shared_models is not None and gpu_id == 0 and pretrained_models:
+                print(f"GPU {gpu_id} - Initializing shared models with pretrained parameters")
+                # Initialize shared models with pretrained weights
+                for role in ['runner', 'blocker']:
+                    role_key = f"{role}_network"
+                    if role_key not in shared_models:
+                        shared_models[role_key] = {}
+                    
+                    if role in pretrained_models:
+                        # Copy pretrained parameters to shared models
+                        for param_name, param_value in pretrained_models[role].items():
+                            shared_models[role_key][param_name] = param_value.cpu()
+                        print(f"GPU {gpu_id} - Initialized shared {role} parameters from pretrained model")
 
             # Training metrics tracking for timeout prevention
             timeout_penalty_stats = {
@@ -896,7 +1236,8 @@ class ParallelPPOTrainer:
                     current_lr = trainer.optimizers[next(iter(trainer.optimizers))].param_groups[0]['lr']
 
                     # Log progress with role-specific information and timeout prevention metrics
-                    print(f"GPU {gpu_id} - Iteration {iteration}/{training_args['num_iterations']} completed in {elapsed_time:.2f}s")
+                    training_status = "CONTINUING" if pretrained_models else "FROM SCRATCH"
+                    print(f"GPU {gpu_id} - Iteration {iteration}/{training_args['num_iterations']} completed in {elapsed_time:.2f}s ({training_status})")
                     print(f"  Total reward: {avg_total_reward:.4f}")
                     print(f"  Runner reward: {avg_runner_reward:.4f}")
                     print(f"  Blocker reward: {avg_blocker_reward:.4f}")
@@ -910,15 +1251,16 @@ class ParallelPPOTrainer:
                         print(f"  NO TIMEOUT PENALTIES - agents actively racing!")
 
                     # Log metrics to file with role breakdown and timeout prevention
+                    training_mode = "continue" if pretrained_models else "new"
                     with open(log_file, 'a') as f:
                         f.write(f"iteration={iteration},total_reward={avg_total_reward:.4f},"
                             f"runner_reward={avg_runner_reward:.4f},blocker_reward={avg_blocker_reward:.4f},"
                             f"policy_loss={policy_loss:.4f},value_loss={value_loss:.4f},"
                             f"time={elapsed_time:.2f},lr={current_lr:.6f},"
                             f"timeout_penalties={total_timeout_penalties},max_penalty={max_timeout_penalty:.4f},"
-                            f"episodes_with_penalties={episodes_with_timeout_penalty}\n")
+                            f"episodes_with_penalties={episodes_with_timeout_penalty},mode={training_mode}\n")
 
-                    # Send enhanced metrics to visualization if enabled
+                    # Send enhanced metrics to visualization if enabled - also non-blocking
                     if vis_queue is not None:
                         metrics = {
                             'iteration': iteration,
@@ -931,11 +1273,16 @@ class ParallelPPOTrainer:
                             'timeout_penalties': total_timeout_penalties,
                             'max_timeout_penalty': max_timeout_penalty,
                             'episodes_with_penalties': episodes_with_timeout_penalty,
-                            'worker_id': f"gpu_{gpu_id}"
+                            'worker_id': f"gpu_{gpu_id}",
+                            'gpu_id': gpu_id,
+                            'training_mode': training_mode
                         }
-                        vis_queue.put(metrics)
-                        print(f"GPU {gpu_id} sent metrics for iteration {iteration}")
-                    
+                        try:
+                            vis_queue.put_nowait(metrics)
+                        except queue.Full:
+                            # Queue is full, skip this update
+                            pass
+
                     # Save models periodically
                     if iteration % training_args['save_interval'] == 0:
                         for pod_key, network in trainer.pod_networks.items():
@@ -957,7 +1304,8 @@ class ParallelPPOTrainer:
                                 role = "runner" if team_pod_idx == 0 else "blocker"
                                 
                                 # Create descriptive filename with role and timeout prevention info
-                                base_filename = f"player{player_idx}_{role}_notimeout_gpu{gpu_id}"
+                                mode_suffix = "continued" if pretrained_models else "notimeout"
+                                base_filename = f"player{player_idx}_{role}_{mode_suffix}_gpu{gpu_id}"
                                 
                                 # Save with iteration number
                                 torch.save(network.state_dict(), save_dir / f"{base_filename}_iter{iteration}.pt")
@@ -980,6 +1328,10 @@ class ParallelPPOTrainer:
                             print(f"  SUCCESS: Low penalty rate indicates agents are actively racing!")
                         elif avg_penalties_per_iter > 5.0:
                             print(f"  WARNING: High penalty rate - agents may still be exploiting timeouts")
+                        
+                        # Additional info for continued training
+                        if pretrained_models:
+                            print(f"  CONTINUED TRAINING: Building on pretrained model performance")
                     
                     # Try enabling mixed precision after a few successful iterations if it was requested
                     if use_mixed_precision and not trainer.use_mixed_precision and iteration == 10:
@@ -1021,7 +1373,8 @@ class ParallelPPOTrainer:
                     'avg_penalties_per_iteration': timeout_penalty_stats['total_penalties'] / training_args['num_iterations'],
                     'max_penalty': timeout_penalty_stats['max_penalty_per_iteration'],
                     'episodes_with_penalties': timeout_penalty_stats['episodes_with_penalties']
-                }
+                },
+                'training_mode': 'continued' if pretrained_models else 'new'
             }
 
         except Exception as e:
@@ -1034,7 +1387,7 @@ class ParallelPPOTrainer:
             }
 
     def train(self, visualization_panel=None):
-        """Start parallel training across GPUs with improved error handling and timeout prevention"""
+        """Start parallel training across GPUs with improved error handling, timeout prevention, and model loading support"""
         print("Starting parallel training with timeout penalty system...")
         print(f"Training parameters: num_iterations={self.trainer_args.get('num_iterations')}, steps_per_iteration={self.trainer_args.get('steps_per_iteration')}")
         print(f"Timeout prevention enabled with penalty weight: {self.env_config.get('timeout_penalty_weight', 0.01)}")
@@ -1044,6 +1397,22 @@ class ParallelPPOTrainer:
         print(f"  - Shared experience: {self.shared_experience_buffer}")
         print(f"  - Gradient aggregation: {self.gradient_aggregation}")
         print(f"  - Adaptive learning rate: {self.adaptive_lr}")
+        
+        # Load pretrained models if continuing training (NEW)
+        pretrained_models = None
+        if self.continue_training:
+            print("Attempting to load pretrained models...")
+            try:
+                pretrained_models = self._load_pretrained_models()
+                if pretrained_models:
+                    print("Successfully loaded pretrained models for continued training")
+                else:
+                    print("Failed to load pretrained models, starting from scratch")
+            except Exception as e:
+                print(f"Error loading pretrained models: {e}")
+                print("Starting training from scratch")
+        else:
+            print("Starting training from scratch (continue_training=False)")
         
         # Create environment indices for each GPU
         all_env_indices = np.arange(self.total_envs).reshape(self.num_gpus, self.envs_per_gpu)
@@ -1080,8 +1449,7 @@ class ParallelPPOTrainer:
         vis_connector = None
         if visualization_panel is not None:
             print("Setting up visualization connection...")
-            vis_queue = manager.Queue()
-            from sebulba_pod_trainer.training.visualization_connector import VisualizationConnector
+            vis_queue = manager.Queue(maxsize=2000)  # Larger queue for recording
             vis_connector = VisualizationConnector(visualization_panel)
             vis_connector.start(vis_queue)
             print("Visualization connection established")
@@ -1114,14 +1482,16 @@ class ParallelPPOTrainer:
                     self.sync_interval,          # Model synchronization interval
                     self.gradient_aggregation,   # Whether to aggregate gradients
                     self.adaptive_lr,            # Whether to use adaptive learning rate
-                    self.num_gpus                # Number of GPUs for coordination
+                    self.num_gpus,               # Number of GPUs for coordination
+                    pretrained_models            # Pretrained models for continued training (NEW)
                 )
             )
             self.processes.append(p)
             p.start()
 
         # Monitor training progress
-        print("Monitoring parallel training progress with timeout prevention...")
+        training_mode = "continued training" if pretrained_models else "new training"
+        print(f"Monitoring parallel {training_mode} progress with timeout prevention...")
         start_time = time.time()
         last_sync_report = time.time()
         
@@ -1137,9 +1507,11 @@ class ParallelPPOTrainer:
                     alive_workers = sum(1 for p in self.processes if p.is_alive())
                     elapsed_minutes = (current_time - start_time) / 60
                     
-                    print(f"Training status after {elapsed_minutes:.1f} minutes:")
+                    print(f"{training_mode.capitalize()} status after {elapsed_minutes:.1f} minutes:")
                     print(f"  - Active workers: {alive_workers}/{len(self.processes)}")
                     print(f"  - Timeout prevention system active")
+                    if pretrained_models:
+                        print(f"  - Building on pretrained model knowledge")
                     
                     # Report shared metrics if available
                     if shared_metrics:
@@ -1167,7 +1539,7 @@ class ParallelPPOTrainer:
                         # Don't terminate other processes, let them complete naturally
                 
         except KeyboardInterrupt:
-            print("Training interrupted by user. Terminating processes...")
+            print(f"Training interrupted by user. Terminating processes...")
             for p in self.processes:
                 if p.is_alive():
                     p.terminate()
@@ -1184,8 +1556,7 @@ class ParallelPPOTrainer:
             # Stop visualization connector if it was started
             if vis_connector:
                 print("Stopping visualization connector...")
-                vis_connector.stop()
-        
+                vis_connector.stop()        
         print("All worker processes completed")
         
         # Report final results with timeout prevention metrics
@@ -1202,11 +1573,12 @@ class ParallelPPOTrainer:
             print(error_msg)
             raise RuntimeError(error_msg)
         
-        print("Parallel training with timeout prevention completed successfully")
+        training_type = "Continued training" if pretrained_models else "New training"
+        print(f"{training_type} with timeout prevention completed successfully")
         return True
 
     def _report_training_results(self, shared_results):
-        """Report final training results from all workers with timeout prevention metrics"""
+        """Report final training results from all workers with timeout prevention metrics and training mode info"""
         print("\n" + "="*60)
         print("PARALLEL TRAINING RESULTS WITH TIMEOUT PREVENTION")
         print("="*60)
@@ -1217,6 +1589,7 @@ class ParallelPPOTrainer:
         policy_losses = []
         value_losses = []
         timeout_metrics = []
+        training_modes = []
         
         for key, result in shared_results.items():
             if result.get('completed', False):
@@ -1224,8 +1597,9 @@ class ParallelPPOTrainer:
                 final_rewards = result.get('final_rewards', {})
                 final_losses = result.get('final_losses', {})
                 timeout_prevention = result.get('timeout_prevention_metrics', {})
+                training_mode = result.get('training_mode', 'unknown')
                 
-                print(f"\nGPU {gpu_id} Results:")
+                print(f"\nGPU {gpu_id} Results ({training_mode} training):")
                 print(f"  Total Reward: {final_rewards.get('total', 'N/A'):.4f}")
                 print(f"  Runner Reward: {final_rewards.get('runner', 'N/A'):.4f}")
                 print(f"  Blocker Reward: {final_rewards.get('blocker', 'N/A'):.4f}")
@@ -1262,6 +1636,7 @@ class ParallelPPOTrainer:
                     value_losses.append(final_losses['value'])
                 if timeout_prevention:
                     timeout_metrics.append(timeout_prevention)
+                training_modes.append(training_mode)
         
         # Calculate and report averages
         if total_rewards:
@@ -1271,6 +1646,16 @@ class ParallelPPOTrainer:
             print(f"  Average Blocker Reward: {np.mean(blocker_rewards):.4f} ± {np.std(blocker_rewards):.4f}")
             print(f"  Average Policy Loss: {np.mean(policy_losses):.4f} ± {np.std(policy_losses):.4f}")
             print(f"  Average Value Loss: {np.mean(value_losses):.4f} ± {np.std(value_losses):.4f}")
+        
+        # Report training mode summary
+        if training_modes:
+            mode_counts = {}
+            for mode in training_modes:
+                mode_counts[mode] = mode_counts.get(mode, 0) + 1
+            
+            print(f"\nTRAINING MODE SUMMARY:")
+            for mode, count in mode_counts.items():
+                print(f"  {mode.capitalize()} training: {count} worker(s)")
         
         # Report timeout prevention summary
         if timeout_metrics:
@@ -1309,7 +1694,8 @@ class ParallelPPOTrainer:
                         timeout_info = ""
                         if 'timeout_penalties' in data:
                             timeout_info = f", penalties={data['timeout_penalties']}"
-                        print(f"Received metric data: iteration={data['iteration']}, reward={data.get('total_reward', 0):.4f}{timeout_info}")
+                        training_mode = data.get('training_mode', 'unknown')
+                        print(f"Received metric data: iteration={data['iteration']}, reward={data.get('total_reward', 0):.4f}{timeout_info}, mode={training_mode}")
                     elif 'race_state' in data:
                         print(f"Received race state data with {len(data['race_state'].get('pods', []))} pods")
                     
