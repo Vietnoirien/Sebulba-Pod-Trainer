@@ -711,9 +711,9 @@ class OptimizedRaceEnvironment:
                 self.last_checkpoint_turn[reached, pod_idx] = self.turn_count[reached].squeeze()
                 
                 # Debug checkpoint reached
-                for b in range(self.batch_size):
-                    if reached[b] and b == 0:  # Only for first batch
-                        print(f"Pod {pod_idx} reached checkpoint: now at {pod.current_checkpoint[b].item()}")
+                # for b in range(self.batch_size):
+                    # if reached[b] and b == 0:  # Only for first batch
+                        # print(f"Pod {pod_idx} reached checkpoint: now at {pod.current_checkpoint[b].item()}")
                 
                 # Check if race is now completed after updating checkpoint
                 newly_finished = pod.current_checkpoint.squeeze() >= batch_total_checkpoints
@@ -731,10 +731,10 @@ class OptimizedRaceEnvironment:
         batch_total_checkpoints = self.batch_checkpoint_counts * self.laps
         
         # Debug race status
-        if self.batch_size > 0:
-            print(f"Race status: turn={self.turn_count[0].item()}, " +
-                ", ".join([f"pod{i}_cp={self.pods[i].current_checkpoint[0].item()}" for i in range(4)]) +
-                f", total_cp={batch_total_checkpoints[0].item()}")
+        #if self.batch_size > 0:
+            #print(f"Race status: turn={self.turn_count[0].item()}, " +
+            #    ", ".join([f"pod{i}_cp={self.pods[i].current_checkpoint[0].item()}" for i in range(4)]) +
+            #    f", total_cp={batch_total_checkpoints[0].item()}")
         
         # Check if any pod has completed all checkpoints
         for player_idx in range(2):
@@ -759,8 +759,8 @@ class OptimizedRaceEnvironment:
         self.done = new_done
         
         # Debug done status
-        if self.batch_size > 0:
-            print(f"Done status: {self.done[0].item()}")
+        #if self.batch_size > 0:
+        #    print(f"Done status: {self.done[0].item()}")
             
     def _get_timeout_penalties(self) -> Dict[int, torch.Tensor]:
         """Get timeout penalties for each pod (for debugging/info)"""
@@ -943,15 +943,15 @@ class OptimizedRaceEnvironment:
             )
             
             # Debug info - FIX: Only print for first pod and first batch item
-            if pod_idx == 0 and self.batch_size > 0:
+            #if pod_idx == 0 and self.batch_size > 0:
                 # Only access the first element of each tensor for printing
                 # Make sure to handle different tensor dimensions properly
-                print(f"Runner reward components: checkpoint={checkpoint_reward[0, 0].item():.3f}, "
-                    f"bonus={checkpoint_bonus[0, 0].item():.3f}, lap={lap_bonus[0, 0].item():.3f}, "
-                    f"dist={distance_reward[0, 0].item():.3f}, vel={velocity_reward[0, 0].item():.3f}, "
-                    f"speed={speed_reward[0, 0].item():.3f}, thrust={thrust_reward[0].item() if thrust_reward.dim() == 1 else thrust_reward[0, 0].item():.3f}, "
-                    f"timeout={timeout_penalty[0, 0].item():.3f}, "
-                    f"total={total_reward[0, 0].item():.3f}")
+            #    print(f"Runner reward components: checkpoint={checkpoint_reward[0, 0].item():.3f}, "
+            #        f"bonus={checkpoint_bonus[0, 0].item():.3f}, lap={lap_bonus[0, 0].item():.3f}, "
+            #        f"dist={distance_reward[0, 0].item():.3f}, vel={velocity_reward[0, 0].item():.3f}, "
+            #        f"speed={speed_reward[0, 0].item():.3f}, thrust={thrust_reward[0].item() if thrust_reward.dim() == 1 else thrust_reward[0, 0].item():.3f}, "
+            #        f"timeout={timeout_penalty[0, 0].item():.3f}, "
+            #        f"total={total_reward[0, 0].item():.3f}")
             
             return total_reward
         
@@ -1028,12 +1028,12 @@ class OptimizedRaceEnvironment:
             )
             
             # Debug info - FIX: Only print for first blocker pod and first batch item
-            if pod_idx == 1 and self.batch_size > 0:
+            #if pod_idx == 1 and self.batch_size > 0:
                 # Only access the first element of each tensor for printing
-                print(f"Blocker reward components: checkpoint={checkpoint_reward[0, 0].item():.3f}, "
-                    f"blocking={blocking_reward[0, 0].item():.3f}, support={support_reward[0, 0].item():.3f}, "
-                    f"movement={movement_reward[0, 0].item():.3f}, timeout={timeout_penalty[0, 0].item():.3f}, "
-                    f"shield={shield_spam_penalty[0, 0].item():.3f}, total={total_reward[0, 0].item():.3f}")
+            #    print(f"Blocker reward components: checkpoint={checkpoint_reward[0, 0].item():.3f}, "
+            #        f"blocking={blocking_reward[0, 0].item():.3f}, support={support_reward[0, 0].item():.3f}, "
+            #        f"movement={movement_reward[0, 0].item():.3f}, timeout={timeout_penalty[0, 0].item():.3f}, "
+            #        f"shield={shield_spam_penalty[0, 0].item():.3f}, total={total_reward[0, 0].item():.3f}")
             
             return total_reward
         
@@ -1272,10 +1272,10 @@ class OptimizedRaceEnvironment:
                         next_cp_idx = pod.current_checkpoint[b] % num_cp
                         
                         # Debug info
-                        if b == 0 and pod_idx == 0:  # Only print for first batch and first pod
-                            print(f"Debug _get_next_checkpoint_positions: pod={pod_idx}, batch={b}, "
-                                f"current_cp={pod.current_checkpoint[b].item()}, num_cp={num_cp}, "
-                                f"next_cp_idx={next_cp_idx.item()}")
+                        #if b == 0 and pod_idx == 0:  # Only print for first batch and first pod
+                        #    print(f"Debug _get_next_checkpoint_positions: pod={pod_idx}, batch={b}, "
+                        #        f"current_cp={pod.current_checkpoint[b].item()}, num_cp={num_cp}, "
+                        #        f"next_cp_idx={next_cp_idx.item()}")
                         
                         # Ensure the index is within bounds
                         next_cp_idx = min(int(next_cp_idx.item()), num_cp - 1)

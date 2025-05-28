@@ -112,7 +112,7 @@ class LeaguePanel(wx.Panel):
         
         # Create grid for league members
         self.members_grid = wx.grid.Grid(self)
-        self.members_grid.CreateGrid(10, 5)  # Default 10 rows, 5 columns
+        self.members_grid.CreateGrid(10, 6)  # Added one more column for import info
         
         # Set column labels
         self.members_grid.SetColLabelValue(0, "ID")
@@ -120,6 +120,7 @@ class LeaguePanel(wx.Panel):
         self.members_grid.SetColLabelValue(2, "ELO")
         self.members_grid.SetColLabelValue(3, "Win Rate")
         self.members_grid.SetColLabelValue(4, "Generation")
+        self.members_grid.SetColLabelValue(5, "Source")
         
         # Set column widths
         self.members_grid.SetColSize(0, 50)
@@ -127,6 +128,7 @@ class LeaguePanel(wx.Panel):
         self.members_grid.SetColSize(2, 80)
         self.members_grid.SetColSize(3, 100)
         self.members_grid.SetColSize(4, 100)
+        self.members_grid.SetColSize(5, 120)
         
         # Make grid read-only
         for row in range(self.members_grid.GetNumberRows()):
@@ -139,11 +141,15 @@ class LeaguePanel(wx.Panel):
         league_btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         
         self.init_league_btn = wx.Button(self, label="Initialize League")
+        self.import_model_btn = wx.Button(self, label="Import Trained Model")
+        self.export_model_btn = wx.Button(self, label="Export Model")
         self.start_league_btn = wx.Button(self, label="Start League Training")
         self.stop_league_btn = wx.Button(self, label="Stop League Training")
         self.tournament_btn = wx.Button(self, label="Run Tournament")
         
         league_btn_sizer.Add(self.init_league_btn, 0, wx.RIGHT, 5)
+        league_btn_sizer.Add(self.import_model_btn, 0, wx.RIGHT, 5)
+        league_btn_sizer.Add(self.export_model_btn, 0, wx.RIGHT, 5)
         league_btn_sizer.Add(self.start_league_btn, 0, wx.RIGHT, 5)
         league_btn_sizer.Add(self.stop_league_btn, 0, wx.RIGHT, 5)
         league_btn_sizer.Add(self.tournament_btn, 0)
@@ -168,6 +174,8 @@ class LeaguePanel(wx.Panel):
         # Bind events
         self.dir_btn.Bind(wx.EVT_BUTTON, self.on_browse_dir)
         self.init_league_btn.Bind(wx.EVT_BUTTON, self.on_init_league)
+        self.import_model_btn.Bind(wx.EVT_BUTTON, self.on_import_model)
+        self.export_model_btn.Bind(wx.EVT_BUTTON, self.on_export_model)
         self.start_league_btn.Bind(wx.EVT_BUTTON, self.on_start_league)
         self.stop_league_btn.Bind(wx.EVT_BUTTON, self.on_stop_league)
         self.tournament_btn.Bind(wx.EVT_BUTTON, self.on_run_tournament)
@@ -176,6 +184,195 @@ class LeaguePanel(wx.Panel):
         # Initially disable some buttons
         self.stop_league_btn.Disable()
         self.on_multi_gpu_changed(None)  # Initialize GPU controls state
+    
+    def load_league_members(self):
+        """Load league members from the save directory"""
+        try:
+            import json
+            from pathlib import Path
+            
+            save_dir = Path(self.dir_ctrl.GetValue())
+            metadata_path = save_dir / 'league_metadata.json'
+            
+            if not metadata_path.exists():
+                # Clear grid if no metadata exists
+                self.members_grid.ClearGrid()
+                return
+            
+            # Load metadata
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            
+            members = metadata.get('members', [])
+            
+            # Resize grid if needed
+            if self.members_grid.GetNumberRows() != len(members):
+                if self.members_grid.GetNumberRows() > len(members):
+                    self.members_grid.DeleteRows(0, self.members_grid.GetNumberRows() - len(members))
+                else:
+                    self.members_grid.AppendRows(len(members) - self.members_grid.GetNumberRows())
+            
+            # Update grid with member data
+            for i, member in enumerate(members):
+                self.members_grid.SetCellValue(i, 0, str(member.get('id', i)))
+                self.members_grid.SetCellValue(i, 1, member.get('name', f"agent_{i}"))
+                self.members_grid.SetCellValue(i, 2, str(round(member.get('elo', 1000), 1)))
+                
+                wins = member.get('wins', 0)
+                matches = member.get('matches', 0)
+                win_rate = wins / max(1, matches)
+                self.members_grid.SetCellValue(i, 3, f"{win_rate:.2f} ({wins}/{matches})")
+                
+                self.members_grid.SetCellValue(i, 4, str(member.get('generation', 0)))
+                
+                # Show source information
+                if 'imported_from' in member:
+                    source_info = f"Imported ({member.get('import_format', 'unknown')})"
+                else:
+                    source_info = "League"
+                self.members_grid.SetCellValue(i, 5, source_info)
+            
+            # Make grid read-only
+            for row in range(self.members_grid.GetNumberRows()):
+                for col in range(self.members_grid.GetNumberCols()):
+                    self.members_grid.SetReadOnly(row, col)
+            
+            self.status_text.AppendText(f"Loaded {len(members)} league members from {metadata_path}\n")
+            
+        except Exception as e:
+            self.status_text.AppendText(f"Error loading league members: {str(e)}\n")
+    
+    def on_import_model(self, event):
+        """Import a trained model from external source"""
+        with wx.DirDialog(self, "Choose directory containing trained models") as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                source_dir = dlg.GetPath()
+                
+                # Ask for member name
+                with wx.TextEntryDialog(self, "Enter name for imported model:", "Import Model", "imported_model") as name_dlg:
+                    if name_dlg.ShowModal() == wx.ID_OK:
+                        member_name = name_dlg.GetValue()
+                        
+                        # Start import in a separate thread
+                        self.status_text.AppendText(f"Importing model from {source_dir}...\n")
+                        
+                        import_thread = threading.Thread(
+                            target=self.import_model_thread,
+                            args=(source_dir, member_name)
+                        )
+                        import_thread.daemon = True
+                        import_thread.start()
+    
+    def import_model_thread(self, source_dir, member_name):
+        """Import model in a separate thread"""
+        try:
+            from ..training.league import PodLeague
+            
+            # Update config first
+            wx.CallAfter(self.update_config)
+            
+            # Get configuration
+            league_config = self.config.get('league_config', {})
+            
+            # Parse devices
+            devices = league_config.get('devices', [0])
+            
+            # Create league instance
+            league = PodLeague(
+                device=torch.device(self.config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')),
+                league_size=league_config.get('league_size', 10),
+                base_save_dir=league_config.get('base_save_dir', 'league_models'),
+                multi_gpu=league_config.get('multi_gpu', False),
+                devices=devices,
+                use_optimized_env=league_config.get('use_optimized_env', True),
+                use_optimized_trainer=league_config.get('use_optimized_trainer', True),
+                batch_size=league_config.get('batch_size', 64),
+                use_mixed_precision=league_config.get('use_mixed_precision', True)
+            )
+            
+            # Import the model
+            member_idx = league.import_trained_model(source_dir, member_name)
+            
+            # Update UI
+            wx.CallAfter(self.status_text.AppendText, f"Successfully imported {member_name} as member {member_idx}\n")
+            wx.CallAfter(self.load_league_members)
+            
+        except Exception as e:
+            wx.CallAfter(self.status_text.AppendText, f"Error importing model: {str(e)}\n")
+    
+    def on_export_model(self, event):
+        """Export a league member to trainer format"""
+        # Get selected member from grid
+        selected_row = self.members_grid.GetGridCursorRow()
+        if selected_row < 0:
+            wx.MessageBox("Please select a league member to export", "Export Model", wx.OK | wx.ICON_INFORMATION)
+            return
+        
+        # Get member ID from grid
+        try:
+            member_id = int(self.members_grid.GetCellValue(selected_row, 0))
+        except (ValueError, IndexError):
+            wx.MessageBox("Invalid member selection", "Export Model", wx.OK | wx.ICON_ERROR)
+            return
+        
+        # Choose export directory
+        with wx.DirDialog(self, "Choose export directory") as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                export_dir = dlg.GetPath()
+                
+                # Choose export format
+                format_choices = ["trainer_new (player0_runner.pt, player0_blocker.pt)", 
+                                "trainer_old (player0_pod0.pt, player0_pod1.pt)"]
+                with wx.SingleChoiceDialog(self, "Choose export format:", "Export Format", format_choices) as format_dlg:
+                    if format_dlg.ShowModal() == wx.ID_OK:
+                        format_selection = format_dlg.GetSelection()
+                        format_type = "trainer_new" if format_selection == 0 else "trainer_old"
+                        
+                        # Start export in a separate thread
+                        self.status_text.AppendText(f"Exporting member {member_id} to {export_dir}...\n")
+                        
+                        export_thread = threading.Thread(
+                            target=self.export_model_thread,
+                            args=(member_id, export_dir, format_type)
+                        )
+                        export_thread.daemon = True
+                        export_thread.start()
+    
+    def export_model_thread(self, member_id, export_dir, format_type):
+        """Export model in a separate thread"""
+        try:
+            from ..training.league import PodLeague
+            
+            # Update config first
+            wx.CallAfter(self.update_config)
+            
+            # Get configuration
+            league_config = self.config.get('league_config', {})
+            
+            # Parse devices
+            devices = league_config.get('devices', [0])
+            
+            # Create league instance
+            league = PodLeague(
+                device=torch.device(self.config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')),
+                league_size=league_config.get('league_size', 10),
+                base_save_dir=league_config.get('base_save_dir', 'league_models'),
+                multi_gpu=league_config.get('multi_gpu', False),
+                devices=devices,
+                use_optimized_env=league_config.get('use_optimized_env', True),
+                use_optimized_trainer=league_config.get('use_optimized_trainer', True),
+                batch_size=league_config.get('batch_size', 64),
+                use_mixed_precision=league_config.get('use_mixed_precision', True)
+            )
+            
+            # Export the model
+            league.export_member_to_trainer_format(member_id, export_dir, format_type)
+            
+            # Update UI
+            wx.CallAfter(self.status_text.AppendText, f"Successfully exported member {member_id} to {export_dir}\n")
+            
+        except Exception as e:
+            wx.CallAfter(self.status_text.AppendText, f"Error exporting model: {str(e)}\n")
     
     def on_multi_gpu_changed(self, event):
         """Enable/disable GPU device selection based on multi-GPU checkbox"""
@@ -249,56 +446,6 @@ class LeaguePanel(wx.Panel):
                 # Try to load league members from this directory
                 self.load_league_members()
     
-    def load_league_members(self):
-        """Load league members from the save directory"""
-        try:
-            import json
-            from pathlib import Path
-            
-            save_dir = Path(self.dir_ctrl.GetValue())
-            metadata_path = save_dir / 'league_metadata.json'
-            
-            if not metadata_path.exists():
-                # Clear grid if no metadata exists
-                self.members_grid.ClearGrid()
-                return
-            
-            # Load metadata
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-            
-            members = metadata.get('members', [])
-            
-            # Resize grid if needed
-            if self.members_grid.GetNumberRows() != len(members):
-                if self.members_grid.GetNumberRows() > len(members):
-                    self.members_grid.DeleteRows(0, self.members_grid.GetNumberRows() - len(members))
-                else:
-                    self.members_grid.AppendRows(len(members) - self.members_grid.GetNumberRows())
-            
-            # Update grid with member data
-            for i, member in enumerate(members):
-                self.members_grid.SetCellValue(i, 0, str(member.get('id', i)))
-                self.members_grid.SetCellValue(i, 1, member.get('name', f"agent_{i}"))
-                self.members_grid.SetCellValue(i, 2, str(round(member.get('elo', 1000), 1)))
-                
-                wins = member.get('wins', 0)
-                matches = member.get('matches', 0)
-                win_rate = wins / max(1, matches)
-                self.members_grid.SetCellValue(i, 3, f"{win_rate:.2f} ({wins}/{matches})")
-                
-                self.members_grid.SetCellValue(i, 4, str(member.get('generation', 0)))
-            
-            # Make grid read-only
-            for row in range(self.members_grid.GetNumberRows()):
-                for col in range(self.members_grid.GetNumberCols()):
-                    self.members_grid.SetReadOnly(row, col)
-            
-            self.status_text.AppendText(f"Loaded {len(members)} league members from {metadata_path}\n")
-            
-        except Exception as e:
-            self.status_text.AppendText(f"Error loading league members: {str(e)}\n")
-    
     def on_init_league(self, event):
         """Initialize a new league"""
         dlg = wx.MessageDialog(self, 
@@ -370,6 +517,8 @@ class LeaguePanel(wx.Panel):
         # Update button states
         self.start_league_btn.Disable()
         self.init_league_btn.Disable()
+        self.import_model_btn.Disable()
+        self.export_model_btn.Disable()
         self.stop_league_btn.Enable()
         
         league_thread = threading.Thread(target=self.start_league_training)
@@ -427,6 +576,8 @@ class LeaguePanel(wx.Panel):
         # Update button states
         self.start_league_btn.Enable()
         self.init_league_btn.Enable()
+        self.import_model_btn.Enable()
+        self.export_model_btn.Enable()
         self.stop_league_btn.Disable()
         
         # Reload league members
@@ -440,6 +591,8 @@ class LeaguePanel(wx.Panel):
         # Update button states
         self.start_league_btn.Enable()
         self.init_league_btn.Enable()
+        self.import_model_btn.Enable()
+        self.export_model_btn.Enable()
         self.stop_league_btn.Disable()
     
     def on_stop_league(self, event):

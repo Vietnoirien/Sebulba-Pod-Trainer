@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple, Any
 import copy
 import json
 import os
+import glob
 
 from ..models.neural_pod import PodNetwork
 from ..environment.race_env import RaceEnvironment
@@ -54,6 +55,210 @@ class PodLeague:
         # Cache for environments and trainers to avoid recreating them
         self.env_cache = {}
         self.trainer_cache = {}
+    
+    def detect_model_format(self, model_dir: Path) -> str:
+        """
+        Detect the format of models in the given directory.
+        
+        Returns:
+            'standard': pod0.pt, pod1.pt
+            'parallel_old': player0_pod0_gpu*.pt, player0_pod1_gpu*.pt
+            'parallel_new': player0_runner_gpu*.pt, player0_blocker_gpu*.pt
+            'trainer_old': player0_pod0.pt, player0_pod1.pt
+            'trainer_new': player0_runner.pt, player0_blocker.pt
+            'unknown': No recognizable format found
+        """
+        # Check for standard league format
+        if (model_dir / "pod0.pt").exists() and (model_dir / "pod1.pt").exists():
+            return 'standard'
+        
+        # Check for trainer format (old naming)
+        if (model_dir / "player0_pod0.pt").exists() and (model_dir / "player0_pod1.pt").exists():
+            return 'trainer_old'
+        
+        # Check for trainer format (new naming)
+        if (model_dir / "player0_runner.pt").exists() and (model_dir / "player0_blocker.pt").exists():
+            return 'trainer_new'
+        
+        # Check for parallel trainer format (old naming)
+        old_gpu_files = list(model_dir.glob("player0_pod0_gpu*.pt")) + list(model_dir.glob("player0_pod1_gpu*.pt"))
+        if len(old_gpu_files) >= 2:
+            return 'parallel_old'
+        
+        # Check for parallel trainer format (new naming)
+        new_gpu_files = list(model_dir.glob("player0_runner_gpu*.pt")) + list(model_dir.glob("player0_blocker_gpu*.pt"))
+        if len(new_gpu_files) >= 2:
+            return 'parallel_new'
+        
+        return 'unknown'
+    
+    def load_model_from_format(self, model_dir: Path, pod_idx: int, format_type: str) -> torch.Tensor:
+        """
+        Load a model state dict from the specified directory and format.
+        
+        Args:
+            model_dir: Directory containing the models
+            pod_idx: Pod index (0 or 1)
+            format_type: Format type returned by detect_model_format
+            
+        Returns:
+            Model state dict
+        """
+        if format_type == 'standard':
+            model_path = model_dir / f"pod{pod_idx}.pt"
+            
+        elif format_type == 'trainer_old':
+            model_path = model_dir / f"player0_pod{pod_idx}.pt"
+            
+        elif format_type == 'trainer_new':
+            role = 'runner' if pod_idx == 0 else 'blocker'
+            model_path = model_dir / f"player0_{role}.pt"
+            
+        elif format_type == 'parallel_old':
+            # Find the latest GPU model for this pod
+            gpu_files = list(model_dir.glob(f"player0_pod{pod_idx}_gpu*.pt"))
+            if not gpu_files:
+                raise FileNotFoundError(f"No parallel models found for pod {pod_idx}")
+            # Sort by modification time and take the latest
+            gpu_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            model_path = gpu_files[0]
+            
+        elif format_type == 'parallel_new':
+            # Find the latest GPU model for this role
+            role = 'runner' if pod_idx == 0 else 'blocker'
+            gpu_files = list(model_dir.glob(f"player0_{role}_gpu*.pt"))
+            if not gpu_files:
+                raise FileNotFoundError(f"No parallel models found for role {role}")
+            # Sort by modification time and take the latest
+            gpu_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            model_path = gpu_files[0]
+            
+        else:
+            raise ValueError(f"Unknown format type: {format_type}")
+        
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        
+        return torch.load(model_path, map_location=self.device)
+    
+    def import_trained_model(self, source_dir: str, member_name: str = None) -> int:
+        """
+        Import a trained model from parallel PPO trainer or other sources into the league.
+        
+        Args:
+            source_dir: Directory containing the trained models
+            member_name: Optional name for the new league member
+            
+        Returns:
+            Index of the newly created league member
+        """
+        source_path = Path(source_dir)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Source directory does not exist: {source_dir}")
+        
+        # Detect the format of the source models
+        format_type = self.detect_model_format(source_path)
+        if format_type == 'unknown':
+            raise ValueError(f"No recognizable model format found in {source_dir}")
+        
+        print(f"Detected model format: {format_type}")
+        
+        # Generate new member ID and name
+        new_id = len(self.league_members)
+        if member_name is None:
+            member_name = f"imported_agent_{new_id}"
+        
+        # Create new member entry
+        new_member = {
+            'id': new_id,
+            'name': member_name,
+            'wins': 0,
+            'matches': 0,
+            'elo': 1200,  # Start with slightly higher ELO since it's a trained model
+            'generation': 0,
+            'model_path': str(self.base_save_dir / f"member_{new_id}"),
+            'imported_from': str(source_path),
+            'import_format': format_type
+        }
+        
+        # Create directory for this member
+        member_dir = Path(new_member['model_path'])
+        member_dir.mkdir(exist_ok=True)
+        
+        # Load and convert models to league format
+        try:
+            for pod_idx in range(2):
+                # Load the model state dict from the source
+                state_dict = self.load_model_from_format(source_path, pod_idx, format_type)
+                
+                # Save in league format
+                torch.save(state_dict, member_dir / f"pod{pod_idx}.pt")
+                
+            print(f"Successfully imported models for {member_name}")
+            
+        except Exception as e:
+            # Clean up on failure
+            if member_dir.exists():
+                import shutil
+                shutil.rmtree(member_dir)
+            raise RuntimeError(f"Failed to import models: {str(e)}")
+        
+        # Add to league
+        self.league_members.append(new_member)
+        
+        # Save league metadata
+        self.save_metadata()
+        
+        print(f"Added imported member: {new_member['name']} (ELO: {new_member['elo']})")
+        return new_id
+    
+    def export_member_to_trainer_format(self, member_idx: int, export_dir: str, format_type: str = 'trainer_new'):
+        """
+        Export a league member's models to trainer format for further training.
+        
+        Args:
+            member_idx: Index of the league member to export
+            export_dir: Directory to export the models to
+            format_type: Format to export ('trainer_old' or 'trainer_new')
+        """
+        if member_idx >= len(self.league_members):
+            raise ValueError(f"Invalid member index: {member_idx}")
+        
+        member = self.league_members[member_idx]
+        source_dir = Path(member['model_path'])
+        export_path = Path(export_dir)
+        export_path.mkdir(parents=True, exist_ok=True)
+        
+        # Copy models to trainer format
+        for pod_idx in range(2):
+            source_file = source_dir / f"pod{pod_idx}.pt"
+            if not source_file.exists():
+                raise FileNotFoundError(f"Source model not found: {source_file}")
+            
+            if format_type == 'trainer_old':
+                target_file = export_path / f"player0_pod{pod_idx}.pt"
+            elif format_type == 'trainer_new':
+                role = 'runner' if pod_idx == 0 else 'blocker'
+                target_file = export_path / f"player0_{role}.pt"
+            else:
+                raise ValueError(f"Unsupported export format: {format_type}")
+            
+            # Copy the model file
+            import shutil
+            shutil.copy2(source_file, target_file)
+        
+        # Export metadata
+        metadata = {
+            'exported_from_league': True,
+            'original_member': member,
+            'export_format': format_type,
+            'export_timestamp': str(torch.datetime.now())
+        }
+        
+        with open(export_path / "export_metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"Exported {member['name']} to {export_path} in {format_type} format")
     
     def print_gpu_config(self):
         """Print GPU configuration information"""

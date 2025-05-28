@@ -508,8 +508,8 @@ class ModelExporter:
             code.append("    # Extract action components")
             code.append("    angle = math.tanh(action[0])")  # Range: [-1, 1]
             code.append("    thrust = sigmoid([action[1]])[0]")  # Range: [0, 1]
-            code.append("    shield_prob = sigmoid([action[2]])[0]")  # Range: [0, 1]
-            code.append("    boost_prob = sigmoid([action[3]])[0]")  # Range: [0, 1]
+            code.append("    boost_prob = sigmoid([action[2]])[0]")  # Range: [0, 1]
+            code.append("    shield_prob = sigmoid([action[3]])[0]")  # Range: [0, 1]
             
         else:
             # Legacy model structure with separate policy and special heads
@@ -886,7 +886,7 @@ class ModelExporter:
 
         # Store command for this pod
         code.append("        # Store command for this pod")
-        code.append("        commands.append(f\"{int(target_x)} {int(target_y)} {thrust_command}\")")
+        code.append("        commands.append(f\"{int(target_x)} {int(target_y)} {thrust_command} {pod_id} {angle_output:.3f} {thrust:.3f} {shield_prob:.3f} {boost_prob:.3f}\")")
         code.append("")
         
         # Output commands for both pods
