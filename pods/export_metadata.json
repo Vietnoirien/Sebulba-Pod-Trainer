@@ -1,0 +1,16 @@
+{
+  "exported_from_league": true,
+  "original_member": {
+    "id": 10,
+    "name": "PPO",
+    "wins": 24,
+    "matches": 24,
+    "elo": 1341.6400542435813,
+    "generation": 0,
+    "model_path": "league_models/member_10",
+    "imported_from": "/home/viet/git-perso/SPT/models",
+    "import_format": "parallel_new"
+  },
+  "export_format": "trainer_new",
+  "export_timestamp": "2025-05-28T10:14:18.293296"
+}

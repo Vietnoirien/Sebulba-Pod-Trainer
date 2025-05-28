@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import glob
+from datetime import datetime
 
 from ..models.neural_pod import PodNetwork
 from ..environment.race_env import RaceEnvironment
@@ -252,7 +253,7 @@ class PodLeague:
             'exported_from_league': True,
             'original_member': member,
             'export_format': format_type,
-            'export_timestamp': str(torch.datetime.now())
+            'export_timestamp': datetime.now().isoformat()
         }
         
         with open(export_path / "export_metadata.json", "w") as f:
