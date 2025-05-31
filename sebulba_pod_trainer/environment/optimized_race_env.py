@@ -571,10 +571,10 @@ class OptimizedRaceEnvironment:
         }
         
         # Debug step info for first batch
-        if self.batch_size > 0 and self.turn_count[0].item() % 10 == 0:  # Every 10 steps
-            print(f"Step {self.turn_count[0].item()}: " +
-                f"done={self.done[0].item()}, " +
-                ", ".join([f"pod{i}_cp={self.pods[i].current_checkpoint[0].item()}" for i in range(4)]))
+        #if self.batch_size > 0 and self.turn_count[0].item() % 10 == 0:  # Every 10 steps
+        #    print(f"Step {self.turn_count[0].item()}: " +
+        #        f"done={self.done[0].item()}, " +
+        #        ", ".join([f"pod{i}_cp={self.pods[i].current_checkpoint[0].item()}" for i in range(4)]))
         
         return observations, rewards, self.done, info
 

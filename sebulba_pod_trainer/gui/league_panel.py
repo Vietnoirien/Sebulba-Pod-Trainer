@@ -14,6 +14,7 @@ class LeaguePanel(wx.Panel):
         
         # League state
         self.league_running = False
+        self.active_league = None
         
         # Create UI components
         self.create_ui()
@@ -87,24 +88,32 @@ class LeaguePanel(wx.Panel):
         gpu_sizer.Add(devices_label, 0, wx.ALL, 5)
         gpu_sizer.Add(self.devices_ctrl, 0, wx.EXPAND | wx.ALL, 5)
         
-        # Optimized environment checkbox
-        self.opt_env_cb = wx.CheckBox(self, label="Use Optimized Environment")
-        self.opt_env_cb.SetValue(True)
-        gpu_sizer.Add(self.opt_env_cb, 0, wx.ALL, 5)
-        
-        # Optimized trainer checkbox
-        self.opt_trainer_cb = wx.CheckBox(self, label="Use Optimized Trainer")
-        self.opt_trainer_cb.SetValue(True)
-        gpu_sizer.Add(self.opt_trainer_cb, 0, wx.ALL, 5)
-        
         # Mixed precision checkbox
         self.mixed_precision_cb = wx.CheckBox(self, label="Use Mixed Precision Training")
         self.mixed_precision_cb.SetValue(True)
         gpu_sizer.Add(self.mixed_precision_cb, 0, wx.ALL, 5)
         
-        # Add GPU optimization section to config sizer
+        # Parallel training options
+        parallel_box = wx.StaticBox(self, label="Parallel Training")
+        parallel_sizer = wx.StaticBoxSizer(parallel_box, wx.VERTICAL)
+        
+        # Enable parallel training checkbox
+        self.parallel_training_cb = wx.CheckBox(self, label="Enable Parallel Training (Train All Members Simultaneously)")
+        self.parallel_training_cb.SetValue(True)
+        parallel_sizer.Add(self.parallel_training_cb, 0, wx.ALL, 5)
+        
+        # Max concurrent trainings
+        concurrent_label = wx.StaticText(self, label="Max Concurrent Trainings (0 = auto):")
+        self.concurrent_ctrl = wx.SpinCtrl(self, min=0, max=16, initial=0)
+        concurrent_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        concurrent_sizer.Add(concurrent_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        concurrent_sizer.Add(self.concurrent_ctrl, 0)
+        parallel_sizer.Add(concurrent_sizer, 0, wx.ALL, 5)
+        
+        # Add sections to config sizer
         config_sizer.Add(param_grid, 0, wx.EXPAND | wx.ALL, 10)
         config_sizer.Add(gpu_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        config_sizer.Add(parallel_sizer, 0, wx.EXPAND | wx.ALL, 10)
         
         # League members section
         members_box = wx.StaticBox(self, label="League Members")
@@ -112,7 +121,7 @@ class LeaguePanel(wx.Panel):
         
         # Create grid for league members
         self.members_grid = wx.grid.Grid(self)
-        self.members_grid.CreateGrid(10, 6)  # Added one more column for import info
+        self.members_grid.CreateGrid(10, 7)
         
         # Set column labels
         self.members_grid.SetColLabelValue(0, "ID")
@@ -121,6 +130,7 @@ class LeaguePanel(wx.Panel):
         self.members_grid.SetColLabelValue(3, "Win Rate")
         self.members_grid.SetColLabelValue(4, "Generation")
         self.members_grid.SetColLabelValue(5, "Source")
+        self.members_grid.SetColLabelValue(6, "Status")
         
         # Set column widths
         self.members_grid.SetColSize(0, 50)
@@ -129,6 +139,7 @@ class LeaguePanel(wx.Panel):
         self.members_grid.SetColSize(3, 100)
         self.members_grid.SetColSize(4, 100)
         self.members_grid.SetColSize(5, 120)
+        self.members_grid.SetColSize(6, 100)
         
         # Make grid read-only
         for row in range(self.members_grid.GetNumberRows()):
@@ -146,10 +157,12 @@ class LeaguePanel(wx.Panel):
         self.start_league_btn = wx.Button(self, label="Start League Training")
         self.stop_league_btn = wx.Button(self, label="Stop League Training")
         self.tournament_btn = wx.Button(self, label="Run Tournament")
+        self.train_all_btn = wx.Button(self, label="Train All Members")
         
         league_btn_sizer.Add(self.init_league_btn, 0, wx.RIGHT, 5)
         league_btn_sizer.Add(self.import_model_btn, 0, wx.RIGHT, 5)
         league_btn_sizer.Add(self.export_model_btn, 0, wx.RIGHT, 5)
+        league_btn_sizer.Add(self.train_all_btn, 0, wx.RIGHT, 5)
         league_btn_sizer.Add(self.start_league_btn, 0, wx.RIGHT, 5)
         league_btn_sizer.Add(self.stop_league_btn, 0, wx.RIGHT, 5)
         league_btn_sizer.Add(self.tournament_btn, 0)
@@ -163,10 +176,23 @@ class LeaguePanel(wx.Panel):
         self.status_text = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_READONLY, size=(-1, 150))
         status_sizer.Add(self.status_text, 1, wx.EXPAND | wx.ALL, 5)
         
+        # Training progress section
+        progress_box = wx.StaticBox(self, label="Training Progress")
+        progress_sizer = wx.StaticBoxSizer(progress_box, wx.VERTICAL)
+        
+        # Progress gauge
+        self.progress_gauge = wx.Gauge(self, range=100)
+        progress_sizer.Add(self.progress_gauge, 0, wx.EXPAND | wx.ALL, 5)
+        
+        # Progress text
+        self.progress_text = wx.StaticText(self, label="Ready")
+        progress_sizer.Add(self.progress_text, 0, wx.ALL, 5)
+        
         # Add sections to main sizer
         main_sizer.Add(config_sizer, 0, wx.EXPAND | wx.ALL, 10)
         main_sizer.Add(members_sizer, 1, wx.EXPAND | wx.ALL, 10)
         main_sizer.Add(status_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        main_sizer.Add(progress_sizer, 0, wx.EXPAND | wx.ALL, 10)
         
         # Set sizer
         self.SetSizer(main_sizer)
@@ -176,14 +202,21 @@ class LeaguePanel(wx.Panel):
         self.init_league_btn.Bind(wx.EVT_BUTTON, self.on_init_league)
         self.import_model_btn.Bind(wx.EVT_BUTTON, self.on_import_model)
         self.export_model_btn.Bind(wx.EVT_BUTTON, self.on_export_model)
+        self.train_all_btn.Bind(wx.EVT_BUTTON, self.on_train_all_members)
         self.start_league_btn.Bind(wx.EVT_BUTTON, self.on_start_league)
         self.stop_league_btn.Bind(wx.EVT_BUTTON, self.on_stop_league)
         self.tournament_btn.Bind(wx.EVT_BUTTON, self.on_run_tournament)
         self.multi_gpu_cb.Bind(wx.EVT_CHECKBOX, self.on_multi_gpu_changed)
+        self.parallel_training_cb.Bind(wx.EVT_CHECKBOX, self.on_parallel_training_changed)
         
         # Initially disable some buttons
         self.stop_league_btn.Disable()
         self.on_multi_gpu_changed(None)  # Initialize GPU controls state
+        self.on_parallel_training_changed(None)  # Initialize parallel training controls state
+        
+        # Timer for updating member status during training
+        self.update_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_update_timer, self.update_timer)
     
     def load_league_members(self):
         """Load league members from the save directory"""
@@ -231,6 +264,9 @@ class LeaguePanel(wx.Panel):
                 else:
                     source_info = "League"
                 self.members_grid.SetCellValue(i, 5, source_info)
+                
+                # Status column (will be updated during training)
+                self.members_grid.SetCellValue(i, 6, "Ready")
             
             # Make grid read-only
             for row in range(self.members_grid.GetNumberRows()):
@@ -241,6 +277,36 @@ class LeaguePanel(wx.Panel):
             
         except Exception as e:
             self.status_text.AppendText(f"Error loading league members: {str(e)}\n")
+    
+    def update_member_status(self, member_idx: int, status: str):
+        """Update the status of a specific member in the grid"""
+        if member_idx < self.members_grid.GetNumberRows():
+            self.members_grid.SetCellValue(member_idx, 6, status)
+            self.members_grid.Refresh()
+    
+    def on_update_timer(self, event):
+        """Timer event to update UI during training"""
+        if self.league_running and self.active_league:
+            # Update progress based on training threads
+            if hasattr(self.active_league, 'training_threads'):
+                total_members = len(self.active_league.league_members)
+                active_threads = len([t for t in self.active_league.training_threads if t.is_alive()])
+                
+                if total_members > 0:
+                    progress = max(0, min(100, int((total_members - active_threads) / total_members * 100)))
+                    self.progress_gauge.SetValue(progress)
+                    self.progress_text.SetLabel(f"Training: {active_threads} active threads, {progress}% complete")
+                    
+                    # Update member statuses
+                    for i in range(total_members):
+                        if i < len(self.active_league.training_threads):
+                            thread = self.active_league.training_threads[i]
+                            if thread.is_alive():
+                                self.update_member_status(i, "Training")
+                            else:
+                                self.update_member_status(i, "Complete")
+                        else:
+                            self.update_member_status(i, "Waiting")
     
     def on_import_model(self, event):
         """Import a trained model from external source"""
@@ -284,8 +350,6 @@ class LeaguePanel(wx.Panel):
                 base_save_dir=league_config.get('base_save_dir', 'league_models'),
                 multi_gpu=league_config.get('multi_gpu', False),
                 devices=devices,
-                use_optimized_env=league_config.get('use_optimized_env', True),
-                use_optimized_trainer=league_config.get('use_optimized_trainer', True),
                 batch_size=league_config.get('batch_size', 64),
                 use_mixed_precision=league_config.get('use_mixed_precision', True)
             )
@@ -320,25 +384,17 @@ class LeaguePanel(wx.Panel):
             if dlg.ShowModal() == wx.ID_OK:
                 export_dir = dlg.GetPath()
                 
-                # Choose export format
-                format_choices = ["trainer_new (player0_runner.pt, player0_blocker.pt)", 
-                                "trainer_old (player0_pod0.pt, player0_pod1.pt)"]
-                with wx.SingleChoiceDialog(self, "Choose export format:", "Export Format", format_choices) as format_dlg:
-                    if format_dlg.ShowModal() == wx.ID_OK:
-                        format_selection = format_dlg.GetSelection()
-                        format_type = "trainer_new" if format_selection == 0 else "trainer_old"
-                        
-                        # Start export in a separate thread
-                        self.status_text.AppendText(f"Exporting member {member_id} to {export_dir}...\n")
-                        
-                        export_thread = threading.Thread(
-                            target=self.export_model_thread,
-                            args=(member_id, export_dir, format_type)
-                        )
-                        export_thread.daemon = True
-                        export_thread.start()
+                # Start export in a separate thread
+                self.status_text.AppendText(f"Exporting member {member_id} to {export_dir}...\n")
+                
+                export_thread = threading.Thread(
+                    target=self.export_model_thread,
+                    args=(member_id, export_dir)
+                )
+                export_thread.daemon = True
+                export_thread.start()
     
-    def export_model_thread(self, member_id, export_dir, format_type):
+    def export_model_thread(self, member_id, export_dir):
         """Export model in a separate thread"""
         try:
             from ..training.league import PodLeague
@@ -359,14 +415,12 @@ class LeaguePanel(wx.Panel):
                 base_save_dir=league_config.get('base_save_dir', 'league_models'),
                 multi_gpu=league_config.get('multi_gpu', False),
                 devices=devices,
-                use_optimized_env=league_config.get('use_optimized_env', True),
-                use_optimized_trainer=league_config.get('use_optimized_trainer', True),
                 batch_size=league_config.get('batch_size', 64),
                 use_mixed_precision=league_config.get('use_mixed_precision', True)
             )
             
             # Export the model
-            league.export_member_to_trainer_format(member_id, export_dir, format_type)
+            league.export_member_to_trainer_format(member_id, export_dir)
             
             # Update UI
             wx.CallAfter(self.status_text.AppendText, f"Successfully exported member {member_id} to {export_dir}\n")
@@ -378,6 +432,11 @@ class LeaguePanel(wx.Panel):
         """Enable/disable GPU device selection based on multi-GPU checkbox"""
         is_multi_gpu = self.multi_gpu_cb.GetValue()
         self.devices_ctrl.Enable(is_multi_gpu)
+    
+    def on_parallel_training_changed(self, event):
+        """Enable/disable parallel training controls"""
+        is_parallel = self.parallel_training_cb.GetValue()
+        self.concurrent_ctrl.Enable(is_parallel)
     
     def update_from_config(self):
         """Update UI elements from the current configuration"""
@@ -400,12 +459,15 @@ class LeaguePanel(wx.Panel):
         else:
             self.devices_ctrl.SetValue('0')
         
-        self.opt_env_cb.SetValue(league_config.get('use_optimized_env', True))
-        self.opt_trainer_cb.SetValue(league_config.get('use_optimized_trainer', True))
         self.mixed_precision_cb.SetValue(league_config.get('use_mixed_precision', True))
         
-        # Update GPU controls state
+        # Parallel training settings
+        self.parallel_training_cb.SetValue(league_config.get('parallel_training', True))
+        self.concurrent_ctrl.SetValue(league_config.get('max_concurrent_trainings', 0))
+        
+        # Update controls state
         self.on_multi_gpu_changed(None)
+        self.on_parallel_training_changed(None)
         
         # Load league members if available
         self.load_league_members()
@@ -431,9 +493,9 @@ class LeaguePanel(wx.Panel):
             'batch_size': self.batch_ctrl.GetValue(),
             'multi_gpu': self.multi_gpu_cb.GetValue(),
             'devices': devices,
-            'use_optimized_env': self.opt_env_cb.GetValue(),
-            'use_optimized_trainer': self.opt_trainer_cb.GetValue(),
-            'use_mixed_precision': self.mixed_precision_cb.GetValue()
+            'use_mixed_precision': self.mixed_precision_cb.GetValue(),
+            'parallel_training': self.parallel_training_cb.GetValue(),
+            'max_concurrent_trainings': self.concurrent_ctrl.GetValue()
         }
         
         self.config['league_config'] = league_config
@@ -478,15 +540,13 @@ class LeaguePanel(wx.Panel):
             # Parse devices
             devices = league_config.get('devices', [0])
             
-            # Create league with GPU optimization settings
+            # Create league with updated configuration
             league = PodLeague(
                 device=torch.device(self.config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')),
                 league_size=league_config.get('league_size', 10),
                 base_save_dir=league_config.get('base_save_dir', 'league_models'),
                 multi_gpu=league_config.get('multi_gpu', False),
                 devices=devices,
-                use_optimized_env=league_config.get('use_optimized_env', True),
-                use_optimized_trainer=league_config.get('use_optimized_trainer', True),
                 batch_size=league_config.get('batch_size', 64),
                 use_mixed_precision=league_config.get('use_mixed_precision', True)
             )
@@ -501,8 +561,82 @@ class LeaguePanel(wx.Panel):
         except Exception as e:
             wx.CallAfter(self.status_text.AppendText, f"Error initializing league: {str(e)}\n")
     
+    def on_train_all_members(self, event):
+        """Train all league members simultaneously"""
+        if self.league_running:
+            wx.MessageBox("League training is already running", "Training Error", wx.OK | wx.ICON_INFORMATION)
+            return
+        
+        # Update config
+        self.update_config()
+        
+        # Start training in a separate thread
+        self.league_running = True
+        self.status_text.AppendText("Starting parallel training for all members...\n")
+        
+        # Update button states
+        self.start_league_btn.Disable()
+        self.train_all_btn.Disable()
+        self.init_league_btn.Disable()
+        self.import_model_btn.Disable()
+        self.export_model_btn.Disable()
+        self.stop_league_btn.Enable()
+        
+        # Start progress updates
+        self.progress_gauge.SetValue(0)
+        self.progress_text.SetLabel("Starting training...")
+        self.update_timer.Start(1000)  # Update every second
+        
+        train_thread = threading.Thread(target=self.train_all_members_thread)
+        train_thread.daemon = True
+        train_thread.start()
+    
+    def train_all_members_thread(self):
+        """Train all members in a separate thread"""
+        try:
+            from ..training.league import PodLeague
+            
+            # Get configuration
+            league_config = self.config.get('league_config', {})
+            
+            # Parse devices
+            devices = league_config.get('devices', [0])
+            
+            # Create league with updated configuration
+            league = PodLeague(
+                device=torch.device(self.config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')),
+                league_size=league_config.get('league_size', 10),
+                base_save_dir=league_config.get('base_save_dir', 'league_models'),
+                multi_gpu=league_config.get('multi_gpu', False),
+                devices=devices,
+                batch_size=league_config.get('batch_size', 64),
+                use_mixed_precision=league_config.get('use_mixed_precision', True)
+            )
+            
+            # Store league reference for stopping and progress tracking
+            self.active_league = league
+            
+            # Determine max concurrent trainings
+            max_concurrent = league_config.get('max_concurrent_trainings', 0)
+            if max_concurrent == 0:
+                max_concurrent = None  # Let the league decide
+            
+            # Start parallel training
+            wx.CallAfter(self.status_text.AppendText, "Starting parallel training for all members...\n")
+            
+            completed, failed = league.train_all_members_parallel(
+                num_iterations=league_config.get('training_iterations', 100),
+                max_concurrent_trainings=max_concurrent
+            )
+            
+            # Update UI when done
+            wx.CallAfter(self.on_training_complete, completed, failed)
+            
+        except Exception as e:
+            wx.CallAfter(self.on_training_error, str(e))
+    
     def on_start_league(self, event):
-        """Start league training"""
+        """Start league evolution training"""
         if self.league_running:
             wx.MessageBox("League training is already running", "League Training", wx.OK | wx.ICON_INFORMATION)
             return
@@ -512,14 +646,20 @@ class LeaguePanel(wx.Panel):
         
         # Start league training in a separate thread
         self.league_running = True
-        self.status_text.AppendText("Starting league training...\n")
+        self.status_text.AppendText("Starting league evolution...\n")
         
         # Update button states
         self.start_league_btn.Disable()
+        self.train_all_btn.Disable()
         self.init_league_btn.Disable()
         self.import_model_btn.Disable()
         self.export_model_btn.Disable()
         self.stop_league_btn.Enable()
+        
+        # Start progress updates
+        self.progress_gauge.SetValue(0)
+        self.progress_text.SetLabel("Starting league evolution...")
+        self.update_timer.Start(1000)  # Update every second
         
         league_thread = threading.Thread(target=self.start_league_training)
         league_thread.daemon = True
@@ -536,15 +676,13 @@ class LeaguePanel(wx.Panel):
             # Parse devices
             devices = league_config.get('devices', [0])
             
-            # Create league with GPU optimization settings
+            # Create league with updated configuration
             league = PodLeague(
                 device=torch.device(self.config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')),
                 league_size=league_config.get('league_size', 10),
                 base_save_dir=league_config.get('base_save_dir', 'league_models'),
                 multi_gpu=league_config.get('multi_gpu', False),
                 devices=devices,
-                use_optimized_env=league_config.get('use_optimized_env', True),
-                use_optimized_trainer=league_config.get('use_optimized_trainer', True),
                 batch_size=league_config.get('batch_size', 64),
                 use_mixed_precision=league_config.get('use_mixed_precision', True)
             )
@@ -555,11 +693,12 @@ class LeaguePanel(wx.Panel):
             # Store league reference for stopping
             self.active_league = league
             
-            # Run evolution
+            # Run evolution with parallel training option
             league.evolve_league(
                 iterations=league_config.get('evolution_iterations', 10),
                 training_iterations=league_config.get('training_iterations', 100),
-                tournament_frequency=league_config.get('tournament_frequency', 2)
+                tournament_frequency=league_config.get('tournament_frequency', 2),
+                parallel_training=league_config.get('parallel_training', True)
             )
             
             # Update UI when done
@@ -568,13 +707,73 @@ class LeaguePanel(wx.Panel):
         except Exception as e:
             wx.CallAfter(self.on_league_training_error, str(e))
     
-    def on_league_training_complete(self):
-        """Called when league training completes"""
+    def on_training_complete(self, completed: int, failed: int):
+        """Called when parallel training of all members completes"""
         self.league_running = False
-        self.status_text.AppendText("League training completed\n")
+        self.update_timer.Stop()
+        
+        self.status_text.AppendText(f"Parallel training completed: {completed} successful, {failed} failed\n")
+        
+        # Update progress
+        self.progress_gauge.SetValue(100)
+        self.progress_text.SetLabel(f"Training complete: {completed} successful, {failed} failed")
+        
+        # Reset member statuses
+        for i in range(self.members_grid.GetNumberRows()):
+            self.update_member_status(i, "Ready")
         
         # Update button states
         self.start_league_btn.Enable()
+        self.train_all_btn.Enable()
+        self.init_league_btn.Enable()
+        self.import_model_btn.Enable()
+        self.export_model_btn.Enable()
+        self.stop_league_btn.Disable()
+        
+        # Reload league members
+        self.load_league_members()
+    
+    def on_training_error(self, error_msg: str):
+        """Called when training encounters an error"""
+        self.league_running = False
+        self.update_timer.Stop()
+        
+        self.status_text.AppendText(f"Training error: {error_msg}\n")
+        
+        # Update progress
+        self.progress_gauge.SetValue(0)
+        self.progress_text.SetLabel("Training failed")
+        
+        # Reset member statuses
+        for i in range(self.members_grid.GetNumberRows()):
+            self.update_member_status(i, "Error")
+        
+        # Update button states
+        self.start_league_btn.Enable()
+        self.train_all_btn.Enable()
+        self.init_league_btn.Enable()
+        self.import_model_btn.Enable()
+        self.export_model_btn.Enable()
+        self.stop_league_btn.Disable()
+    
+    def on_league_training_complete(self):
+        """Called when league evolution training completes"""
+        self.league_running = False
+        self.update_timer.Stop()
+        
+        self.status_text.AppendText("League evolution completed\n")
+        
+        # Update progress
+        self.progress_gauge.SetValue(100)
+        self.progress_text.SetLabel("League evolution complete")
+        
+        # Reset member statuses
+        for i in range(self.members_grid.GetNumberRows()):
+            self.update_member_status(i, "Ready")
+        
+        # Update button states
+        self.start_league_btn.Enable()
+        self.train_all_btn.Enable()
         self.init_league_btn.Enable()
         self.import_model_btn.Enable()
         self.export_model_btn.Enable()
@@ -586,10 +785,21 @@ class LeaguePanel(wx.Panel):
     def on_league_training_error(self, error_msg):
         """Called when league training encounters an error"""
         self.league_running = False
+        self.update_timer.Stop()
+        
         self.status_text.AppendText(f"League training error: {error_msg}\n")
+        
+        # Update progress
+        self.progress_gauge.SetValue(0)
+        self.progress_text.SetLabel("League training failed")
+        
+        # Reset member statuses
+        for i in range(self.members_grid.GetNumberRows()):
+            self.update_member_status(i, "Error")
         
         # Update button states
         self.start_league_btn.Enable()
+        self.train_all_btn.Enable()
         self.init_league_btn.Enable()
         self.import_model_btn.Enable()
         self.export_model_btn.Enable()
@@ -601,7 +811,7 @@ class LeaguePanel(wx.Panel):
             return
         
         dlg = wx.MessageDialog(self, 
-                              "Stop league training? The current iteration will complete before stopping.",
+                              "Stop league training? The current operations will complete before stopping.",
                               "Stop League Training",
                               wx.YES_NO | wx.ICON_QUESTION)
         result = dlg.ShowModal()
@@ -609,9 +819,13 @@ class LeaguePanel(wx.Panel):
         
         if result == wx.ID_YES:
             # Set flag to stop training
-            if hasattr(self, 'active_league'):
-                self.status_text.AppendText("Stopping league training after current iteration completes...\n")
+            if hasattr(self, 'active_league') and self.active_league:
+                self.status_text.AppendText("Stopping league training after current operations complete...\n")
                 self.active_league.stop_requested = True
+                
+                # If we have parallel training, stop all threads
+                if hasattr(self.active_league, 'stop_all_training'):
+                    self.active_league.stop_all_training()
             else:
                 self.status_text.AppendText("No active league found to stop\n")
     
@@ -627,6 +841,7 @@ class LeaguePanel(wx.Panel):
         
         # Start tournament in a separate thread
         self.status_text.AppendText("Starting tournament...\n")
+        self.progress_text.SetLabel("Running tournament...")
         
         tournament_thread = threading.Thread(target=self.run_tournament)
         tournament_thread.daemon = True
@@ -643,15 +858,13 @@ class LeaguePanel(wx.Panel):
             # Parse devices
             devices = league_config.get('devices', [0])
             
-            # Create league with GPU optimization settings
+            # Create league with updated configuration
             league = PodLeague(
                 device=torch.device(self.config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')),
                 league_size=league_config.get('league_size', 10),
                 base_save_dir=league_config.get('base_save_dir', 'league_models'),
                 multi_gpu=league_config.get('multi_gpu', False),
                 devices=devices,
-                use_optimized_env=league_config.get('use_optimized_env', True),
-                use_optimized_trainer=league_config.get('use_optimized_trainer', True),
                 batch_size=league_config.get('batch_size', 64),
                 use_mixed_precision=league_config.get('use_mixed_precision', True)
             )
@@ -662,7 +875,9 @@ class LeaguePanel(wx.Panel):
             
             # Update UI when done
             wx.CallAfter(self.status_text.AppendText, "Tournament completed\n")
+            wx.CallAfter(self.progress_text.SetLabel, "Tournament complete")
             wx.CallAfter(self.load_league_members)
             
         except Exception as e:
             wx.CallAfter(self.status_text.AppendText, f"Tournament error: {str(e)}\n")
+            wx.CallAfter(self.progress_text.SetLabel, "Tournament failed")

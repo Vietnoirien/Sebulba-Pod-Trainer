@@ -1,0 +1,14 @@
+{
+  "exported_from_league": true,
+  "original_member": {
+    "id": 2,
+    "name": "random_agent_2",
+    "wins": 5,
+    "matches": 5,
+    "elo": 1069.1811599118748,
+    "generation": 0,
+    "model_path": "test_league_models/member_2"
+  },
+  "export_format": "trainer",
+  "export_timestamp": "2025-05-28T16:52:11.975423"
+}

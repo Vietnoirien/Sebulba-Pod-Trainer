@@ -822,7 +822,7 @@ class VisualizationPanel(wx.Panel):
             print(f"Error in add_metric: {e}")
 
     def load_training_data(self, model_dir):
-        """Load training data from model directory"""
+        """Load training data from model directory - simplified"""
         try:
             # Reset data
             self.rewards = []
@@ -836,73 +836,83 @@ class VisualizationPanel(wx.Panel):
                 wx.MessageBox(f"Model directory does not exist: {model_dir}", "Directory Error", wx.OK | wx.ICON_ERROR)
                 return
             
-            # Check for model files - support both old and new naming conventions
-            # Old convention: player0_pod0.pt, player0_pod1.pt
-            old_standard_files_exist = (model_path / "player0_pod0.pt").exists() and (model_path / "player0_pod1.pt").exists()
+            # Check for any .pt files
+            model_files = list(model_path.glob("*.pt"))
+            if not model_files:
+                wx.MessageBox(f"No .pt model files found in directory: {model_dir}", "Model Files Error", wx.OK | wx.ICON_ERROR)
+                return
             
-            # New convention: player0_runner.pt, player0_blocker.pt
-            new_standard_files_exist = (model_path / "player0_runner.pt").exists() and (model_path / "player0_blocker.pt").exists()
+            print(f"Found {len(model_files)} .pt files in {model_dir}")
             
-            # Old GPU-specific files
-            old_gpu_files = list(model_path.glob("player0_pod0_gpu*.pt")) + list(model_path.glob("player0_pod0_gpu*_iter*.pt"))
-            old_gpu_files_exist = len(old_gpu_files) > 0
+            # Look for training log files
+            log_files = []
             
-            # New GPU-specific files
-            new_gpu_files = list(model_path.glob("player0_runner_gpu*.pt")) + list(model_path.glob("player0_blocker_gpu*.pt"))
-            new_gpu_files_exist = len(new_gpu_files) > 0
+            # Check for various log file patterns
+            log_patterns = [
+                "training_log.txt",
+                "training_log_*.txt",
+                "*.log"
+            ]
             
-            if not (old_standard_files_exist or new_standard_files_exist or old_gpu_files_exist or new_gpu_files_exist):
-                wx.MessageBox(f"Model files not found in directory: {model_dir}\n"
-                            f"Expected either:\n"
-                            f"- Standard files: player0_runner.pt, player0_blocker.pt\n"
-                            f"- GPU-specific files: player0_runner_gpu0.pt, player0_blocker_gpu0.pt\n"
-                            f"- Legacy files: player0_pod0.pt, player0_pod1.pt", 
-                            "Model Files Error", wx.OK | wx.ICON_ERROR)
-            
-            # Look for training log files - support both standard and GPU-specific logs
-            standard_log_path = model_path / "training_log.txt"
-            gpu_log_paths = list(model_path.glob("training_log_gpu_*.txt"))
-            
-            log_files = [standard_log_path] if standard_log_path.exists() else []
-            log_files.extend([p for p in gpu_log_paths if p.exists()])
+            for pattern in log_patterns:
+                log_files.extend(list(model_path.glob(pattern)))
             
             if not log_files:
                 wx.MessageBox(f"No training log files found in: {model_path}", "Log File Error", wx.OK | wx.ICON_WARNING)
                 return
             
+            print(f"Found {len(log_files)} log files")
+            
             # Parse all log files
             for log_path in log_files:
-                with open(log_path, 'r') as f:
-                    for line in f:
-                        try:
-                            parts = line.strip().split(',')
-                            if len(parts) >= 4:
-                                iteration = int(parts[0].split('=')[1])
+                print(f"Parsing log file: {log_path}")
+                try:
+                    with open(log_path, 'r') as f:
+                        for line in f:
+                            try:
+                                # Handle various log formats
+                                if 'iteration=' in line and ('reward=' in line or 'total_reward=' in line):
+                                    parts = line.strip().split(',')
+                                    data = {}
+                                    
+                                    # Parse key=value pairs
+                                    for part in parts:
+                                        if '=' in part:
+                                            key, value = part.split('=', 1)
+                                            try:
+                                                data[key] = float(value)
+                                            except ValueError:
+                                                data[key] = value
+                                    
+                                    # Extract required fields
+                                    iteration = int(data.get('iteration', -1))
+                                    if iteration < 0:
+                                        continue
+                                    
+                                    # Try different reward field names
+                                    reward = data.get('total_reward', data.get('reward', 0))
+                                    policy_loss = data.get('policy_loss', 0)
+                                    value_loss = data.get('value_loss', 0)
+                                    
+                                    self.iterations.append(iteration)
+                                    self.rewards.append(float(reward))
+                                    self.policy_losses.append(float(policy_loss))
+                                    self.value_losses.append(float(value_loss))
+                                    
+                            except Exception as parse_error:
+                                # Skip malformed lines
+                                continue
                                 
-                                # Handle both old and new log formats
-                                if 'total_reward=' in line:
-                                    # New format with role-specific rewards
-                                    reward = float([p for p in parts if p.startswith('total_reward=')][0].split('=')[1])
-                                else:
-                                    # Old format
-                                    reward = float(parts[1].split('=')[1])
-                                
-                                policy_loss = float([p for p in parts if p.startswith('policy_loss=')][0].split('=')[1])
-                                value_loss = float([p for p in parts if p.startswith('value_loss=')][0].split('=')[1])
-                                
-                                self.iterations.append(iteration)
-                                self.rewards.append(reward)
-                                self.policy_losses.append(policy_loss)
-                                self.value_losses.append(value_loss)
-                        except Exception as parse_error:
-                            print(f"Error parsing line: {line} - {str(parse_error)}")
-                            continue
+                except Exception as file_error:
+                    print(f"Error reading log file {log_path}: {file_error}")
+                    continue
             
             # Update plots
             if not self.iterations:
                 wx.MessageBox("No valid training data found in log files", "Data Error", wx.OK | wx.ICON_WARNING)
                 return
                 
+            print(f"Loaded {len(self.iterations)} training data points")
             self.update_plots()
             
             # Populate manual model list if in manual mode
@@ -913,7 +923,8 @@ class VisualizationPanel(wx.Panel):
             import traceback
             error_details = traceback.format_exc()
             wx.MessageBox(f"Error loading training data: {str(e)}\n\nDetails:\n{error_details}", 
-                        "Data Loading Error", wx.OK | wx.ICON_ERROR)    
+                        "Data Loading Error", wx.OK | wx.ICON_ERROR)
+    
     def get_manual_selected_model(self, pod_name, model_path):
         """Get manually selected model file"""
         selection = self.manual_model_choice.GetSelection()
@@ -935,7 +946,7 @@ class VisualizationPanel(wx.Panel):
         return self.find_best_performance_model_file(pod_name, model_path)
     
     def find_best_model_file(self, pod_key, model_path):
-        """Find the best model file based on selection strategy"""
+        """Find the best model file based on selection strategy - simplified to work with any .pt files"""
         selection = self.model_selection_choice.GetSelection()
         strategy = self.model_selection_choice.GetString(selection)
         
@@ -945,7 +956,7 @@ class VisualizationPanel(wx.Panel):
             return self.find_latest_model_file(pod_key, model_path)
         else:  # Best Performance
             return self.find_best_performance_model_file(pod_key, model_path)
-
+    
     def pod_key_to_role(self, pod_key):
         """Convert pod_key to role name"""
         if "pod0" in pod_key:
@@ -955,105 +966,116 @@ class VisualizationPanel(wx.Panel):
         return pod_key  # Return as-is if already in new format
 
     def find_latest_model_file(self, pod_key, model_path):
-        """Find the latest model file by iteration number"""
+        """Find the latest model file by iteration number - simplified"""
         role = self.pod_key_to_role(pod_key)
         
-        # Try new standard filename first
-        new_standard_file = model_path / f"player0_{role}.pt"
-        if new_standard_file.exists():
-            return new_standard_file
+        # Find all .pt files that contain the role name
+        all_pt_files = list(model_path.glob("*.pt"))
+        role_files = [f for f in all_pt_files if role in f.name.lower()]
         
-        # Try legacy standard filename
-        legacy_standard_file = model_path / f"{pod_key}.pt"
-        if legacy_standard_file.exists():
-            return legacy_standard_file
+        if not role_files:
+            # If no role-specific files found, try any .pt file
+            role_files = all_pt_files
         
-        # Collect all iteration files for this role/pod
-        new_iter_files = list(model_path.glob(f"player0_{role}_gpu*_iter*.pt"))
-        legacy_iter_files = list(model_path.glob(f"{pod_key}_gpu*_iter*.pt"))
-        iter_files = new_iter_files + legacy_iter_files
+        if not role_files:
+            return None
         
-        if not iter_files:
-            # Try GPU files without iteration
-            new_gpu_files = list(model_path.glob(f"player0_{role}_gpu*.pt"))
-            legacy_gpu_files = list(model_path.glob(f"{pod_key}_gpu*.pt"))
-            gpu_files = new_gpu_files + legacy_gpu_files
-            return gpu_files[0] if gpu_files else None
+        # Try to find files with iteration numbers
+        iter_files = []
+        for file in role_files:
+            iter_num = self.extract_iteration_number(file.name)
+            if iter_num > 0:
+                iter_files.append((iter_num, file))
         
-        # Sort by iteration number and return the latest
-        iter_files_with_numbers = []
-        for file in iter_files:
-            try:
-                iter_num = self.extract_iteration_number(file.name)
-                iter_files_with_numbers.append((iter_num, file))
-            except (ValueError, IndexError):
-                continue
+        if iter_files:
+            # Sort by iteration number and return the latest
+            iter_files.sort(key=lambda x: x[0], reverse=True)
+            return iter_files[0][1]
         
-        if iter_files_with_numbers:
-            iter_files_with_numbers.sort(key=lambda x: x[0], reverse=True)
-            return iter_files_with_numbers[0][1]
-        
-        return None
+        # If no iteration files, return the first role file
+        return role_files[0]
         
     def find_best_performance_model_file(self, pod_key, model_path):
-        """Find the best model file based on training performance"""
+        """Find the best model file based on training performance - simplified"""
         role = self.pod_key_to_role(pod_key)
         
-        # Try new standard filename first (usually the final/best model)
-        new_standard_file = model_path / f"player0_{role}.pt"
-        if new_standard_file.exists():
-            return new_standard_file
+        # Find all .pt files that contain the role name
+        all_pt_files = list(model_path.glob("*.pt"))
+        role_files = [f for f in all_pt_files if role in f.name.lower()]
         
-        # Try legacy standard filename
-        legacy_standard_file = model_path / f"{pod_key}.pt"
-        if legacy_standard_file.exists():
-            return legacy_standard_file
+        if not role_files:
+            # If no role-specific files found, try any .pt file
+            role_files = all_pt_files
         
-        # Collect all possible model files for this role/pod
-        all_model_files = []
-        
-        # New GPU-specific files without iteration (usually latest/best)
-        new_gpu_files = list(model_path.glob(f"player0_{role}_gpu*.pt"))
-        all_model_files.extend(new_gpu_files)
-        
-        # Legacy GPU-specific files without iteration
-        legacy_gpu_files = list(model_path.glob(f"{pod_key}_gpu*.pt"))
-        all_model_files.extend(legacy_gpu_files)
-        
-        # New GPU-specific files with iteration
-        new_iter_files = list(model_path.glob(f"player0_{role}_gpu*_iter*.pt"))
-        all_model_files.extend(new_iter_files)
-        
-        # Legacy GPU-specific files with iteration
-        legacy_iter_files = list(model_path.glob(f"{pod_key}_gpu*_iter*.pt"))
-        all_model_files.extend(legacy_iter_files)
-        
-        if not all_model_files:
+        if not role_files:
             return None
         
         # Try to find the best model based on training logs
-        best_model = self.find_best_model_from_logs(all_model_files, model_path)
+        best_model = self.find_best_model_from_logs(role_files, model_path)
         if best_model:
             return best_model
         
-        # Fallback: sort by iteration number and take the latest
-        iter_files_with_numbers = []
-        for file in all_model_files:
-            try:
-                if '_iter' in str(file):
-                    iter_num = self.extract_iteration_number(file.name)
-                    iter_files_with_numbers.append((iter_num, file))
-            except (ValueError, IndexError):
-                continue
+        # Fallback: return the latest iteration file
+        return self.find_latest_model_file(pod_key, model_path)
+
+    def extract_iteration_number(self, filename):
+        """Extract iteration number from filename - improved to handle various formats"""
+        try:
+            # Look for patterns like _iter123, iter123, _123.pt, etc.
+            import re
+            
+            # Try different patterns
+            patterns = [
+                r'_iter(\d+)',      # _iter123
+                r'iter(\d+)',       # iter123
+                r'_(\d+)\.pt$',     # _123.pt
+                r'(\d+)\.pt$'       # 123.pt
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, filename)
+                if match:
+                    return int(match.group(1))
+                    
+        except (ValueError, IndexError):
+            pass
+        return 0
+
+    def populate_manual_model_list(self):
+        """Populate the manual model selection dropdown - simplified"""
+        model_dir = self.model_dir_ctrl.GetValue()
+        if not model_dir:
+            return
+            
+        model_path = Path(model_dir)
+        if not model_path.exists():
+            return
         
-        if iter_files_with_numbers:
-            # Sort by iteration number and return the latest
-            iter_files_with_numbers.sort(key=lambda x: x[0], reverse=True)
-            return iter_files_with_numbers[0][1]
+        # Clear existing choices
+        self.manual_model_choice.Clear()
         
-        # Final fallback: return the first file
-        return all_model_files[0]
-    
+        # Find all .pt files
+        model_files = list(model_path.glob("*.pt"))
+        
+        if not model_files:
+            return
+        
+        # Sort files by name and add to dropdown
+        model_files.sort(key=lambda x: x.name)
+        
+        for model_file in model_files:
+            # Extract iteration number for display
+            iter_num = self.extract_iteration_number(model_file.name)
+            if iter_num > 0:
+                display_name = f"Iter {iter_num}: {model_file.name}"
+            else:
+                display_name = f"Model: {model_file.name}"
+            
+            self.manual_model_choice.Append(display_name)
+        
+        if model_files:
+            self.manual_model_choice.SetSelection(0)
+
     def find_best_model_from_logs(self, model_files, model_path):
         """Find the best model based on training log performance"""
         # Look for training log files
@@ -1175,7 +1197,7 @@ class VisualizationPanel(wx.Panel):
         return iter_files[0][1]
 
     def on_visualize_race(self, event):
-        """Start race visualization"""
+        """Start race visualization - simplified model checking"""
         model_dir = self.model_dir_ctrl.GetValue()
         if not model_dir:
             wx.MessageBox("Please select a model directory first", "Visualization Error", wx.OK | wx.ICON_ERROR)
@@ -1187,29 +1209,13 @@ class VisualizationPanel(wx.Panel):
             wx.MessageBox(f"Model directory does not exist: {model_dir}", "Visualization Error", wx.OK | wx.ICON_ERROR)
             return
         
-        # Check if model files exist - support both old and new naming conventions
-        # New convention: player0_runner.pt, player0_blocker.pt
-        new_standard_files_exist = (model_path / "player0_runner.pt").exists() and (model_path / "player0_blocker.pt").exists()
-        
-        # Old convention: player0_pod0.pt, player0_pod1.pt
-        old_standard_files_exist = (model_path / "player0_pod0.pt").exists() and (model_path / "player0_pod1.pt").exists()
-        
-        # New GPU-specific model files (from parallel training)
-        new_gpu_files = list(model_path.glob("player0_runner_gpu*.pt")) + list(model_path.glob("player0_blocker_gpu*.pt"))
-        new_gpu_files_exist = len(new_gpu_files) >= 2  # Need at least one file for each role
-        
-        # Old GPU-specific model files
-        old_gpu_files = list(model_path.glob("player0_pod0_gpu*.pt")) + list(model_path.glob("player0_pod1_gpu*.pt"))
-        old_gpu_files_exist = len(old_gpu_files) >= 2  # Need at least one file for each pod
-        
-        if not (new_standard_files_exist or old_standard_files_exist or new_gpu_files_exist or old_gpu_files_exist):
-            wx.MessageBox(f"Model files not found in directory: {model_dir}\n"
-                        f"Expected either:\n"
-                        f"- New format: player0_runner.pt, player0_blocker.pt\n"
-                        f"- GPU format: player0_runner_gpu0.pt, player0_blocker_gpu0.pt\n"
-                        f"- Legacy format: player0_pod0.pt, player0_pod1.pt", 
-                        "Visualization Error", wx.OK | wx.ICON_ERROR)
+        # Check for any .pt files
+        model_files = list(model_path.glob("*.pt"))
+        if not model_files:
+            wx.MessageBox(f"No .pt model files found in directory: {model_dir}", "Visualization Error", wx.OK | wx.ICON_ERROR)
             return
+        
+        print(f"Found {len(model_files)} .pt files for visualization")
         
         # Start visualization in a separate thread
         self.visualize_race_btn.Disable()
@@ -1217,7 +1223,7 @@ class VisualizationPanel(wx.Panel):
         vis_thread = threading.Thread(target=self.run_race_visualization, args=(model_dir,))
         vis_thread.daemon = True
         vis_thread.start()
-    
+
     def run_race_visualization(self, model_dir):
         """Run race visualization with the selected model"""
         try:
@@ -1501,7 +1507,7 @@ class VisualizationPanel(wx.Panel):
             wx.CallAfter(self.visualize_race_btn.Enable)
 
     def on_run_simulation(self, event):
-        """Run a simulation with the selected model"""
+        """Run a simulation with the selected model - simplified model checking"""
         model_dir = self.model_dir_ctrl.GetValue()
         if not model_dir:
             wx.MessageBox("Please select a model directory first", "Simulation Error", wx.OK | wx.ICON_ERROR)
@@ -1513,29 +1519,13 @@ class VisualizationPanel(wx.Panel):
             wx.MessageBox(f"Model directory does not exist: {model_dir}", "Simulation Error", wx.OK | wx.ICON_ERROR)
             return
         
-        # Check if model files exist - support both old and new naming conventions
-        # New convention: player0_runner.pt, player0_blocker.pt
-        new_standard_files_exist = (model_path / "player0_runner.pt").exists() and (model_path / "player0_blocker.pt").exists()
-        
-        # Old convention: player0_pod0.pt, player0_pod1.pt
-        old_standard_files_exist = (model_path / "player0_pod0.pt").exists() and (model_path / "player0_pod1.pt").exists()
-        
-        # New GPU-specific model files
-        new_gpu_files = list(model_path.glob("player0_runner_gpu*.pt")) + list(model_path.glob("player0_blocker_gpu*.pt"))
-        new_gpu_files_exist = len(new_gpu_files) >= 2  # Need at least one file for each role
-        
-        # Old GPU-specific model files
-        old_gpu_files = list(model_path.glob("player0_pod0_gpu*.pt")) + list(model_path.glob("player0_pod1_gpu*.pt"))
-        old_gpu_files_exist = len(old_gpu_files) >= 2  # Need at least one file for each pod
-        
-        if not (new_standard_files_exist or old_standard_files_exist or new_gpu_files_exist or old_gpu_files_exist):
-            wx.MessageBox(f"Model files not found in directory: {model_dir}\n"
-                        f"Expected either:\n"
-                        f"- New format: player0_runner.pt, player0_blocker.pt\n"
-                        f"- GPU format: player0_runner_gpu0.pt, player0_blocker_gpu0.pt\n"
-                        f"- Legacy format: player0_pod0.pt, player0_pod1.pt", 
-                        "Simulation Error", wx.OK | wx.ICON_ERROR)
+        # Check for any .pt files
+        model_files = list(model_path.glob("*.pt"))
+        if not model_files:
+            wx.MessageBox(f"No .pt model files found in directory: {model_dir}", "Simulation Error", wx.OK | wx.ICON_ERROR)
             return
+        
+        print(f"Found {len(model_files)} .pt files for simulation")
         
         # Start simulation in a separate thread
         self.sim_btn.Disable()
