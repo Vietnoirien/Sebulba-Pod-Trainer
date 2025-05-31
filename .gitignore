@@ -18,7 +18,6 @@ league_models/
 external_sources/
 
 # Training outputs
-*.png
 *.txt
 *.log
 
